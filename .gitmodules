@@ -1,3 +1,6 @@
 [submodule "vendor/nuklear"]
 	path = vendor/nuklear
 	url = https://github.com/Immediate-Mode-UI/Nuklear.git
+[submodule "vendor/sdl3"]
+	path = vendor/sdl3
+	url = https://github.com/libsdl-org/SDL.git
