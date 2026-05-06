@@ -298,6 +298,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
     if (nk_sdl_render_needed(app->ctx))
     {
+        static size_t count = 0;
+        ++count;
+        fprintf(stderr, "redraw count: %zu\n", count);
         SDL_SetRenderDrawColorFloat(app->renderer, app->bg.r, app->bg.g, app->bg.b, app->bg.a);
         SDL_RenderClear(app->renderer);
 
@@ -311,21 +314,18 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 
         SDL_RenderPresent(app->renderer);
     }
-    else
-    {
-        nk_end(app->ctx);
-    }
 
     nk_input_begin(ctx);
     return SDL_APP_CONTINUE;
 }
 
-void SDL_AppQuit(void* appstate, SDL_AppResult result)
+void SDL_AppQuit(void* appstate, const SDL_AppResult result)
 {
-    struct nk_sdl_app* app = (struct nk_sdl_app*)appstate;
+    struct nk_sdl_app* app = appstate;
     NK_UNUSED(result);
 
-    if (app) {
+    if (app)
+    {
         nk_input_end(app->ctx);
         nk_sdl_shutdown(app->ctx);
         SDL_DestroyRenderer(app->renderer);

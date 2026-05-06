@@ -209,9 +209,27 @@ NK_API void nk_sdl_update_text_input(struct nk_context* ctx)
 
 NK_API nk_bool nk_sdl_render_needed(struct nk_context* ctx)
 {
-    static void* cmd_last = NULL;
-    static nk_size cmd_last_size = 0;
+    static void* cmds_last = NULL;
+    static nk_size cmds_last_size = 0;
 
+    const void* cmds = nk_buffer_memory(&ctx->memory);
+    const nk_size cmds_size = ctx->memory.allocated;
+
+    if (cmds_size != cmds_last_size || 0 != memcmp(cmds_last, cmds, cmds_size))
+    {
+        if (cmds_size > cmds_last_size)
+        {
+            cmds_last = nk_sdl_alloc(ctx->userdata, cmds_last, cmds_size);
+        }
+
+        memcpy(cmds_last, cmds, cmds_size);
+        cmds_last_size = cmds_size;
+
+        return true;
+    }
+
+    nk_clear(ctx);
+    return false;
 }
 
 NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA)
@@ -316,14 +334,14 @@ NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA
             SDL_SetRenderClipRect(sdl->renderer, NULL);
         }
 
-        nk_clear(&sdl->ctx);
         nk_buffer_clear(&sdl->ogl.cmds);
         nk_buffer_free(&vbuf);
         nk_buffer_free(&ebuf);
+        nk_clear(&sdl->ctx);
     }
 }
 
-NK_INTERN void nk_sdl_clipboard_paste(nk_handle usr, struct nk_text_edit* edit)
+NK_INTERN void nk_sdl_clipboard_paste(const nk_handle usr, struct nk_text_edit* edit)
 {
     NK_UNUSED(usr);
 
@@ -348,12 +366,12 @@ NK_INTERN void nk_sdl_clipboard_paste(nk_handle usr, struct nk_text_edit* edit)
     SDL_free(text);
 }
 
-NK_INTERN void nk_sdl_clipboard_copy(nk_handle usr, const char *text, int len)
+NK_INTERN void nk_sdl_clipboard_copy(const nk_handle usr, const char* text, const int len)
 {
     struct nk_sdl* sdl = usr.ptr;
     NK_ASSERT(sdl);
 
-    if (len <= 0 || text == NULL)
+    if (len <= 0 || NULL == text)
     {
         return;
     }
@@ -366,6 +384,7 @@ NK_INTERN void nk_sdl_clipboard_copy(nk_handle usr, const char *text, int len)
     NK_UNUSED(ptext);
 #else
     const char* ptext = text;
+
     for (int i = len; i > 0; i--)
     {
         (void)SDL_StepUTF8(&ptext, NULL);
