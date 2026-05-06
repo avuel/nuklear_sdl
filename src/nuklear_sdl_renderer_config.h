@@ -1,13 +1,15 @@
+/* nuklear - public domain */
+
+/* =============================================================== *
+ *                                                                 *
+ *                          CONFIG                                 *
+ *                                                                 *
+ * =============================================================== */
+
 #ifndef NK_SDL3_RENDERER_CONFIG_H_
 #define NK_SDL3_RENDERER_CONFIG_H_
 
 #include <SDL3/SDL.h>
-
-/*   * =============================================================== *
-     *                                                                 *
-     *                          CONFIG                                 *
-     *                                                                 *
-     * =============================================================== */
 
 /* optional: sdl3_renderer does not need any of these defines
  * (but some examples might need them, so be careful) */
@@ -26,7 +28,6 @@
 /* mandatory: sdl3_renderer depends on those defines */
 #define NK_INCLUDE_COMMAND_USERDATA
 #define NK_INCLUDE_VERTEX_BUFFER_OUTPUT
-
 
 /* We can re-use the types provided by SDL which are extremely portable,
  * so there is no need for Nuklear to detect those on its own */
@@ -59,7 +60,7 @@
 
 /* SDL3 does not provide "dtoa" (only integer versions)
  * but we can emulate it with SDL_snprintf */
-static char* nk_sdl_dtoa(char *str, double d);
+char* nk_sdl_dtoa(char* str, double d);
 #define NK_DTOA(str, d) nk_sdl_dtoa(str, d)
 
 /* SDL can also provide us with math functions, but beware that Nuklear's own
@@ -93,13 +94,5 @@ static char* nk_sdl_dtoa(char *str, double d);
 #define STBRP_ASSERT          SDL_assert
 /* There is no need to define STBTT_malloc/STBTT_free macros
  * Nuklear will define those to user-provided nk_allocator */
-
-static char* nk_sdl_dtoa(char *str, double d)
-{
-    NK_ASSERT(str);
-    if (!str) return NULL;
-    (void)SDL_snprintf(str, 99999, "%.17g", d);
-    return str;
-}
 
 #endif // NK_SDL3_RENDERER_CONFIG_H_

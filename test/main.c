@@ -17,7 +17,14 @@
 #include <SDL3/SDL_main.h>
 
 #define NK_SDL3_RENDERER_IMPLEMENTATION
-#include "nuklear_sdl3_renderer.h"
+#include "nuklear_sdl_renderer.h"
+
+NK_GLOBAL const struct nk_color nk_red    = { .r = 255, .g =   0, .b =   0, .a = 255 };
+NK_GLOBAL const struct nk_color nk_green  = { .r =   0, .g = 255, .b =   0, .a = 255 };
+NK_GLOBAL const struct nk_color nk_blue   = { .r =   0, .g =   0, .b = 255, .a = 255 };
+NK_GLOBAL const struct nk_color nk_white  = { .r = 255, .g = 255, .b = 255, .a = 255 };
+NK_GLOBAL const struct nk_color nk_black  = { .r =   0, .g =   0, .b =   0, .a = 255 };
+NK_GLOBAL const struct nk_color nk_yellow = { .r = 255, .g = 255, .b =   0, .a = 255 };
 
 #define WINDOW_WIDTH 1200
 #define WINDOW_HEIGHT 800
