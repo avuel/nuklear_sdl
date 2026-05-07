@@ -1,5 +1,6 @@
 #include "nuklear_sdl_renderer.h"
 
+#define STBRP_STATIC
 #include "../vendor/nuklear/src/nuklear_9slice.c"
 #include "../vendor/nuklear/src/nuklear_buffer.c"
 #include "../vendor/nuklear/src/nuklear_button.c"

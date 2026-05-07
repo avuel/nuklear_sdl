@@ -16,7 +16,6 @@
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL_main.h>
 
-#define NK_SDL3_RENDERER_IMPLEMENTATION
 #include "nuklear_sdl_renderer.h"
 
 NK_GLOBAL const struct nk_color nk_red    = { .r = 255, .g =   0, .b =   0, .a = 255 };
