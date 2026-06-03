@@ -28,6 +28,9 @@ NK_GLOBAL const struct nk_color nk_yellow = { .r = 255, .g = 255, .b =   0, .a =
 #define WINDOW_WIDTH 1200
 #define WINDOW_HEIGHT 800
 
+#define MAX_VERTEX_BUFFER (512 * 1024)
+#define MAX_INDEX_BUFFER  (128 * 1024)
+
 /* ===============================================================
  *
  *                          EXAMPLE
@@ -79,7 +82,7 @@ NK_GLOBAL const struct nk_color nk_yellow = { .r = 255, .g = 255, .b =   0, .a =
 
 struct nk_sdl_app {
     SDL_Window* window;
-    SDL_Renderer* renderer;
+    SDL_GPUDevice* gpu;
     struct nk_context * ctx;
     struct nk_colorf bg;
     enum nk_anti_aliasing AA;
@@ -104,18 +107,35 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     }
 
     app = SDL_malloc(sizeof(*app));
-    if (app == NULL) {
+    if (NULL == app)
+    {
         return nk_sdl_fail();
     }
 
-    if (!SDL_CreateWindowAndRenderer("Nuklear: SDL3 Renderer", WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_RESIZABLE, &app->window, &app->renderer)) {
-        SDL_free(app);
+#ifdef _WIN32
+    const SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_DXIL;
+    const char* const gpu_driver = "direct3d12";
+#else
+    const SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_SPIRV;
+    const char* const driver = "vulkan";
+#endif
+    app->gpu = SDL_CreateGPUDevice(gpu_format, true, gpu_driver);
+    if (NULL == app->gpu)
+    {
         return nk_sdl_fail();
     }
+
+    app->window = SDL_CreateWindow("cui", WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_HIDDEN);
+    if (NULL == app->window)
+    {
+        return nk_sdl_fail();
+    }
+
     *appstate = app;
 
-    if (!SDL_SetRenderVSync(app->renderer, 1)) {
-        SDL_LogError(SDL_LOG_CATEGORY_CUSTOM, "SDL_SetRenderVSync failed: %s", SDL_GetError());
+    if (!SDL_ClaimWindowForGPUDevice(app->gpu, app->window))
+    {
+        return nk_sdl_fail();
     }
 
     app->bg.r = 0.10f;
@@ -125,17 +145,17 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
 
 
     font_scale = 1;
-    {
-        /* This scaling logic was kept simple for the demo purpose.
-         * On some platforms, this might not be the exact scale
-         * that you want to use. For more information, see:
-         * https://wiki.libsdl.org/SDL3/README-highdpi */
-        const float scale = SDL_GetWindowDisplayScale(app->window);
-        SDL_SetRenderScale(app->renderer, scale, scale);
-        font_scale = scale;
-    }
+    // {
+    //     /* This scaling logic was kept simple for the demo purpose.
+    //      * On some platforms, this might not be the exact scale
+    //      * that you want to use. For more information, see:
+    //      * https://wiki.libsdl.org/SDL3/README-highdpi */
+    //     const float scale = SDL_GetWindowDisplayScale(app->window);
+    //     SDL_SetRenderScale(app->renderer, scale, scale);
+    //     font_scale = scale;
+    // }
 
-    ctx = nk_sdl_init(app->window, app->renderer, nk_sdl_allocator());
+    ctx = nk_sdl_init(app->window, app->gpu, nk_sdl_allocator(), MAX_VERTEX_BUFFER, MAX_INDEX_BUFFER);
     app->ctx = ctx;
 
 #if 0
@@ -195,6 +215,11 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     }
 #endif
 
+    if (!SDL_ShowWindow(app->window))
+    {
+        return nk_sdl_fail();
+    }
+
     nk_input_begin(ctx);
 
     return SDL_APP_CONTINUE;
@@ -223,7 +248,7 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event* event)
 
     /* Remember to always rescale the event coordinates,
      * if your renderer uses custom scale. */
-    SDL_ConvertEventToRenderCoordinates(app->renderer, event);
+    // SDL_ConvertEventToRenderCoordinates(app->renderer, event);
 
     nk_sdl_handle_event(app->ctx, event);
 
@@ -300,18 +325,9 @@ SDL_AppResult SDL_AppIterate(void *appstate)
         static size_t count = 0;
         ++count;
         fprintf(stderr, "redraw count: %zu\n", count);
-        SDL_SetRenderDrawColorFloat(app->renderer, app->bg.r, app->bg.g, app->bg.b, app->bg.a);
-        SDL_RenderClear(app->renderer);
 
-        nk_sdl_render(ctx, app->AA);
+        nk_sdl_render(ctx, app->AA, app->bg);
         nk_sdl_update_text_input(ctx);
-
-        /* show if TextInput is active for debug purpose. Feel free to remove this. */
-        SDL_SetRenderDrawColor(app->renderer, 0xFF, 0xFF, 0xFF, 0xFF);
-        SDL_RenderDebugTextFormat(app->renderer, 10, 10, "TextInputActive? %s",
-                                  SDL_TextInputActive(app->window) ? "Yes" : "No");
-
-        SDL_RenderPresent(app->renderer);
     }
 
     nk_input_begin(ctx);
@@ -327,7 +343,7 @@ void SDL_AppQuit(void* appstate, const SDL_AppResult result)
     {
         nk_input_end(app->ctx);
         nk_sdl_shutdown(app->ctx);
-        SDL_DestroyRenderer(app->renderer);
+        SDL_DestroyGPUDevice(app->gpu);
         SDL_DestroyWindow(app->window);
         SDL_free(app);
     }

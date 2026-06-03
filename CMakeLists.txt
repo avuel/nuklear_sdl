@@ -9,4 +9,4 @@ cmake_path(SET nuklear_SOURCE_DIR NORMALIZE "${CMAKE_CURRENT_SOURCE_DIR}/vendor/
 
 add_subdirectory(src)
 
-add_subdirectory(test EXCLUDE_FROM_ALL)
+add_subdirectory(demo EXCLUDE_FROM_ALL)

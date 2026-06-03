@@ -1,6 +1,11 @@
 #include "nuklear_sdl_renderer.h"
 
+#define NK_SIZEOF(st,m) sizeof(((st*)0)->m)
+
+// embed stbrp statically
 #define STBRP_STATIC
+
+// nuklear includes
 #include "../vendor/nuklear/src/nuklear_9slice.c"
 #include "../vendor/nuklear/src/nuklear_buffer.c"
 #include "../vendor/nuklear/src/nuklear_button.c"
@@ -44,6 +49,13 @@
 #include "../vendor/nuklear/src/nuklear_widget.c"
 #include "../vendor/nuklear/src/nuklear_window.c"
 
+// embedded shader includes
+#include "shaders/embed/vertex.c"
+#include "shaders/embed/pixel.c"
+
+// third party includes
+#include <SDL3/SDL_gpu.h>
+
 /*
  * ==============================================================
  *
@@ -53,9 +65,17 @@
  */
 
 struct nk_sdl_device {
+    SDL_GPUDevice* gpu;
+    SDL_GPUGraphicsPipeline* pipeline;
+    SDL_GPUBuffer* buffer_vertex;
+    SDL_GPUBuffer* buffer_index;
+    SDL_GPUTransferBuffer* buffer_transfer;
+    int buffer_vertex_max;
+    int buffer_index_max;
     struct nk_buffer cmds;
     struct nk_draw_null_texture tex_null;
-    SDL_Texture *font_tex;
+    SDL_GPUTexture* font_texture;
+    SDL_GPUSampler* font_sampler;
 };
 
 struct nk_sdl_vertex {
@@ -65,14 +85,12 @@ struct nk_sdl_vertex {
 };
 
 struct nk_sdl {
-    SDL_Window *win;
-    SDL_Renderer *renderer;
-    struct nk_user_font* debug_font;
-    struct nk_sdl_device ogl;
+    SDL_Window* window;
+    struct nk_sdl_device device;
     struct nk_context ctx;
 #ifdef NK_INCLUDE_FONT_BAKING
     struct nk_font_atlas atlas;
-#endif
+#endif // NK_INCLUDE_FONT_BAKING
     struct nk_allocator allocator;
     nk_handle userdata;
     Uint64 last_render;
@@ -80,20 +98,295 @@ struct nk_sdl {
     bool edit_was_active;
 };
 
-NK_API nk_handle nk_sdl_get_userdata(const struct nk_context* ctx)
+NK_INTERN void nk_sdl_clipboard_paste(nk_handle usr, struct nk_text_edit* edit);
+NK_INTERN void nk_sdl_clipboard_copy(nk_handle usr, const char* text, int len);
+NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl);
+NK_INTERN void nk_sdl_device_destroy(struct nk_sdl* sdl);
+
+NK_API struct nk_context* nk_sdl_init(SDL_Window* window, SDL_GPUDevice* gpu, const struct nk_allocator allocator, const int max_vertex_buffer, const int max_index_buffer)
 {
-    NK_ASSERT(ctx);
-    struct nk_sdl* sdl = ctx->userdata.ptr;
+    NK_ASSERT(window);
+    NK_ASSERT(gpu);
+    NK_ASSERT(allocator.alloc);
+    NK_ASSERT(allocator.free);
+    struct nk_sdl* sdl = allocator.alloc(allocator.userdata, 0, sizeof(*sdl));
     NK_ASSERT(sdl);
-    return sdl->userdata;
+    SDL_zerop(sdl);
+
+    sdl->allocator = (struct nk_allocator) {
+        .userdata = allocator.userdata,
+        .alloc    = allocator.alloc,
+        .free     = allocator.free,
+    };
+
+    sdl->window = window;
+
+    nk_init(&sdl->ctx, &sdl->allocator, NULL);
+    sdl->ctx.userdata = nk_handle_ptr(sdl);
+
+    sdl->ctx.clip = (struct nk_clipboard) {
+        .userdata = nk_handle_ptr(sdl),
+        .paste    = nk_sdl_clipboard_paste,
+        .copy     = nk_sdl_clipboard_copy,
+    };
+
+    sdl->device.gpu = gpu;
+    sdl->device.buffer_vertex_max = max_vertex_buffer;
+    sdl->device.buffer_index_max  = max_index_buffer;
+    nk_sdl_device_create(sdl);
+
+    sdl->edit_was_active = false;
+    sdl->insert_toggle = false;
+
+    return &sdl->ctx;
 }
 
-NK_API void nk_sdl_set_userdata(struct nk_context* ctx, const nk_handle userdata)
+NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
+{
+    NK_ASSERT(sdl);
+    nk_buffer_init(&sdl->device.cmds, &sdl->allocator, NK_BUFFER_DEFAULT_INITIAL_SIZE);
+
+    const SDL_GPUShaderFormat gpu_formats = SDL_GetGPUShaderFormats(sdl->device.gpu);
+
+    SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_INVALID;
+
+    // prefer directX
+    if      (0 != (SDL_GPU_SHADERFORMAT_DXIL     & gpu_formats)) { gpu_format = SDL_GPU_SHADERFORMAT_DXIL;     }
+    else if (0 != (SDL_GPU_SHADERFORMAT_DXBC     & gpu_formats)) { gpu_format = SDL_GPU_SHADERFORMAT_DXBC;     }
+    // then metal
+    else if (0 != (SDL_GPU_SHADERFORMAT_METALLIB & gpu_formats)) { gpu_format = SDL_GPU_SHADERFORMAT_METALLIB; }
+    else if (0 != (SDL_GPU_SHADERFORMAT_MSL      & gpu_formats)) { gpu_format = SDL_GPU_SHADERFORMAT_MSL; }
+    // then vulkan
+    else if (0 != (SDL_GPU_SHADERFORMAT_SPIRV    & gpu_formats)) { gpu_format = SDL_GPU_SHADERFORMAT_SPIRV;    }
+
+    NK_ASSERT(SDL_GPU_SHADERFORMAT_INVALID != gpu_format);
+
+    // upload vertex shader program
+    const SDL_GPUShaderCreateInfo shader_vertex_create_info = {
+        .code_size = sizeof(embed_vertex),
+        .code = embed_vertex,
+        .entrypoint = "vs_main",
+        .format = gpu_format,
+        .stage = SDL_GPU_SHADERSTAGE_VERTEX,
+        .num_samplers = 0,
+        .num_storage_textures = 0,
+        .num_storage_buffers = 0,
+        .num_uniform_buffers = 1,
+        .props = 0,
+    };
+
+    SDL_GPUShader* gpu_shader_vertex = SDL_CreateGPUShader(sdl->device.gpu, &shader_vertex_create_info);
+    NK_ASSERT(gpu_shader_vertex);
+
+    // upload pixel shader program
+    const SDL_GPUShaderCreateInfo shader_pixel_create_info = {
+        .code_size = sizeof(embed_pixel),
+        .code = embed_pixel,
+        .entrypoint = "ps_main",
+        .format = gpu_format,
+        .stage = SDL_GPU_SHADERSTAGE_FRAGMENT,
+        .num_samplers = 1,
+        .num_storage_textures = 1,
+        .num_storage_buffers = 0,
+        .num_uniform_buffers = 0,
+        .props = 0,
+    };
+
+    SDL_GPUShader* gpu_shader_pixel = SDL_CreateGPUShader(sdl->device.gpu, &shader_pixel_create_info);
+    NK_ASSERT(gpu_shader_pixel);
+
+    const SDL_GPUColorTargetBlendState color_target_blend = {
+        .src_color_blendfactor   = SDL_GPU_BLENDFACTOR_SRC_ALPHA,
+        .dst_color_blendfactor   = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+        .color_blend_op          = SDL_GPU_BLENDOP_ADD,
+        .src_alpha_blendfactor   = SDL_GPU_BLENDFACTOR_ONE,
+        .dst_alpha_blendfactor   = SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+        .alpha_blend_op          = SDL_GPU_BLENDOP_ADD,
+        .enable_blend            = true,
+        .enable_color_write_mask = true,
+        .color_write_mask        = 0xF,
+    };
+
+    const SDL_GPUGraphicsPipelineCreateInfo graphics_pipeline_create_info = {
+        .vertex_shader   = gpu_shader_vertex,
+        .fragment_shader = gpu_shader_pixel,
+        .primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST,
+        .vertex_input_state = {
+            .num_vertex_buffers = 1,
+            .vertex_buffer_descriptions = (const SDL_GPUVertexBufferDescription[]) {
+                { .slot = 0, .pitch = sizeof(struct nk_sdl_vertex), .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX, .instance_step_rate = 0 },
+            },
+            .num_vertex_attributes = 3,
+            .vertex_attributes = (const SDL_GPUVertexAttribute[]) {
+                    { .location = 0, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = NK_OFFSETOF(struct nk_sdl_vertex, position), },
+                    { .location = 1, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = NK_OFFSETOF(struct nk_sdl_vertex, uv),       },
+                    { .location = 2, .buffer_slot = 0, .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4, .offset = NK_OFFSETOF(struct nk_sdl_vertex, col),      },
+            },
+        },
+        .rasterizer_state = {
+            .fill_mode = SDL_GPU_FILLMODE_FILL,
+            .cull_mode = SDL_GPU_CULLMODE_NONE,
+            .front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE,
+            .depth_bias_constant_factor = 0.0f,
+            .depth_bias_clamp = 0.0f,
+            .depth_bias_slope_factor = 0.0f,
+            .enable_depth_bias = false,
+            .enable_depth_clip = false,
+        },
+        .multisample_state = {
+            .sample_count = 0,
+            .sample_mask  = 0,
+            .enable_mask  = false,
+            .enable_alpha_to_coverage = false,
+        },
+        .depth_stencil_state = {
+            .compare_op = SDL_GPU_COMPAREOP_INVALID,
+            .back_stencil_state = {
+                .fail_op       = SDL_GPU_STENCILOP_INVALID,
+                .pass_op       = SDL_GPU_STENCILOP_INVALID,
+                .depth_fail_op = SDL_GPU_STENCILOP_INVALID,
+                .compare_op    = SDL_GPU_COMPAREOP_INVALID,
+            },
+            .front_stencil_state = {
+                .fail_op       = SDL_GPU_STENCILOP_INVALID,
+                .pass_op       = SDL_GPU_STENCILOP_INVALID,
+                .depth_fail_op = SDL_GPU_STENCILOP_INVALID,
+                .compare_op    = SDL_GPU_COMPAREOP_INVALID,
+            },
+            .compare_mask = 0,
+            .write_mask   = 0,
+            .enable_depth_test   = false,
+            .enable_depth_write  = false,
+            .enable_stencil_test = false,
+        },
+        .target_info = {
+            .num_color_targets = 1,
+            .color_target_descriptions = (const SDL_GPUColorTargetDescription[]) {
+                { .format = SDL_GetGPUSwapchainTextureFormat(sdl->device.gpu, sdl->window), .blend_state = color_target_blend, },
+            },
+            .has_depth_stencil_target = false,
+            .depth_stencil_format = SDL_GPU_TEXTUREFORMAT_INVALID,
+        },
+    };
+
+    // create graphics pipeline
+    sdl->device.pipeline = SDL_CreateGPUGraphicsPipeline(sdl->device.gpu, &graphics_pipeline_create_info);
+    if (NULL == sdl->device.pipeline)
+    {
+        SDL_Log("error: %s", SDL_GetError());
+    }
+    NK_ASSERT(sdl->device.pipeline);
+
+    // free shaders after creating pipeline
+    SDL_ReleaseGPUShader(sdl->device.gpu, gpu_shader_vertex);
+    SDL_ReleaseGPUShader(sdl->device.gpu, gpu_shader_pixel);
+
+    // create vertex buffer
+    const SDL_GPUBufferCreateInfo buffer_vertex_create_info = {
+        .usage = SDL_GPU_BUFFERUSAGE_VERTEX,
+        .size  = sdl->device.buffer_vertex_max,
+        .props = 0,
+    };
+    sdl->device.buffer_vertex = SDL_CreateGPUBuffer(sdl->device.gpu, &buffer_vertex_create_info);
+    NK_ASSERT(sdl->device.buffer_vertex);
+
+    // create index buffer
+    const SDL_GPUBufferCreateInfo buffer_index_create_info = {
+        .usage = SDL_GPU_BUFFERUSAGE_INDEX,
+        .size  = sdl->device.buffer_index_max,
+        .props = 0,
+    };
+    sdl->device.buffer_index = SDL_CreateGPUBuffer(sdl->device.gpu, &buffer_index_create_info);
+    NK_ASSERT(sdl->device.buffer_index);
+
+    // create gpu transfer buffer
+    const SDL_GPUTransferBufferCreateInfo gpu_transfer_buffer_create_info = {
+        .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size  = buffer_vertex_create_info.size + buffer_index_create_info.size,
+        .props = 0
+    };
+    sdl->device.buffer_transfer = SDL_CreateGPUTransferBuffer(sdl->device.gpu, &gpu_transfer_buffer_create_info);
+    NK_ASSERT(sdl->device.buffer_transfer);
+
+    const SDL_GPUSamplerCreateInfo sampler_create_info = {
+        .min_filter        = SDL_GPU_FILTER_LINEAR,
+        .mag_filter        = SDL_GPU_FILTER_LINEAR,
+        .mipmap_mode       = SDL_GPU_SAMPLERMIPMAPMODE_LINEAR,
+        .address_mode_u    = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_v    = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .address_mode_w    = SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
+        .mip_lod_bias      = 0.0f,
+        .max_anisotropy    = 0.0f,
+        .compare_op        = SDL_GPU_COMPAREOP_NEVER,
+        .min_lod           = 0.0f,
+        .max_lod           = 0.0f,
+        .enable_anisotropy = false,
+        .enable_compare    = false,
+        .padding1          = 0,
+        .padding2          = 0,
+
+        .props = 0,
+    };
+    sdl->device.font_sampler = SDL_CreateGPUSampler(sdl->device.gpu, &sampler_create_info);
+}
+
+NK_INTERN void nk_sdl_device_destroy(struct nk_sdl* sdl)
+{
+    if (NULL != sdl->device.font_sampler)
+    {
+        SDL_ReleaseGPUSampler(sdl->device.gpu, sdl->device.font_sampler);
+        sdl->device.font_sampler = NULL;
+    }
+
+    if (NULL != sdl->device.font_texture)
+    {
+        SDL_ReleaseGPUTexture(sdl->device.gpu, sdl->device.font_texture);
+        sdl->device.font_texture = NULL;
+    }
+
+    if (NULL != sdl->device.pipeline)
+    {
+        SDL_ReleaseGPUGraphicsPipeline(sdl->device.gpu, sdl->device.pipeline);
+        sdl->device.pipeline = NULL;
+    }
+
+    if (NULL != sdl->device.buffer_transfer)
+    {
+        SDL_ReleaseGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer);
+        sdl->device.buffer_transfer = NULL;
+    }
+
+    if (NULL != sdl->device.buffer_index)
+    {
+        SDL_ReleaseGPUBuffer(sdl->device.gpu, sdl->device.buffer_index);
+        sdl->device.buffer_index = NULL;
+    }
+
+    if (NULL != sdl->device.buffer_vertex)
+    {
+        SDL_ReleaseGPUBuffer(sdl->device.gpu, sdl->device.buffer_vertex);
+        sdl->device.buffer_vertex = NULL;
+    }
+}
+
+NK_API void nk_sdl_shutdown(struct nk_context* ctx)
 {
     NK_ASSERT(ctx);
     struct nk_sdl* sdl = ctx->userdata.ptr;
     NK_ASSERT(sdl);
-    sdl->userdata = userdata;
+
+#ifdef NK_INCLUDE_FONT_BAKING
+    if (sdl->atlas.font_num > 0)
+    {
+        nk_font_atlas_clear(&sdl->atlas);
+    }
+#endif // NK_INCLUDE_FONT_BAKING
+
+    nk_sdl_device_destroy(sdl);
+    nk_buffer_free(&sdl->device.cmds);
+
+    nk_free(ctx);
+    sdl->allocator.free(sdl->allocator.userdata, sdl);
 }
 
 NK_INTERN void* nk_sdl_alloc(const nk_handle user, void* old, const nk_size size)
@@ -128,343 +421,6 @@ NK_API struct nk_allocator nk_sdl_allocator()
     return allocator;
 }
 
-NK_INTERN void nk_sdl_device_upload_atlas(struct nk_context* ctx, const void* image, const int width, const int height)
-{
-    NK_ASSERT(ctx);
-    NK_ASSERT(image);
-    NK_ASSERT(width > 0);
-    NK_ASSERT(height > 0);
-
-    struct nk_sdl* sdl = ctx->userdata.ptr;
-    NK_ASSERT(sdl);
-
-    /* Clean up if the texture already exists. */
-    if (NULL != sdl->ogl.font_tex)
-    {
-        SDL_DestroyTexture(sdl->ogl.font_tex);
-        sdl->ogl.font_tex = NULL;
-    }
-
-    sdl->ogl.font_tex = SDL_CreateTexture(sdl->renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, width, height);
-    NK_ASSERT(sdl->ogl.font_tex);
-    SDL_UpdateTexture(sdl->ogl.font_tex, NULL, image, 4 * width);
-    SDL_SetTextureBlendMode(sdl->ogl.font_tex, SDL_BLENDMODE_BLEND);
-}
-
-NK_API void nk_sdl_update_text_input(struct nk_context* ctx)
-{
-    NK_ASSERT(ctx);
-    struct nk_sdl* sdl = ctx->userdata.ptr;
-    NK_ASSERT(sdl);
-
-    /* Determine if Nuklear is using any top-level "edit" widget.
-     * Popups take higher priority because they block any incomming input.
-     * This will not work, if the widget is not updating context state properly. */
-    bool active;
-    if (NULL == ctx->active)
-    {
-        active = false;
-    }
-    else if (NULL != ctx->active->popup.win)
-    {
-        active = ctx->active->popup.win->edit.active;
-    }
-    else
-    {
-        active = ctx->active->edit.active;
-    }
-
-    /* decide, if TextInputActive should be unchanged/stoped/started
-     * and change its state accordingly for owned SDL Window */
-    if (active != sdl->edit_was_active)
-    {
-        const bool window_edit_active = SDL_TextInputActive(sdl->win);
-
-        /* If you ever hit this check, it means that the demo and your app
-         * (or something else) are all trying to manage TextInputActive state.
-         * This can cause subtle bugs where the state won't be what you expect.
-         * You can safely remove this assert and the demo will keep working,
-         * but make sure it does not cause any issues for you */
-        NK_ASSERT(window_edit_active == sdl->edit_was_active && "something else changed TextInputActive state for this Window");
-
-        if (!window_edit_active && !sdl->edit_was_active && active)
-        {
-            SDL_StartTextInput(sdl->win);
-        }
-        else if (window_edit_active && sdl->edit_was_active && !active)
-        {
-            SDL_StopTextInput(sdl->win);
-        }
-
-        sdl->edit_was_active = active;
-    }
-
-    /* FIXME:
-     * for full SDL3 integration, you also need to find current edit widget
-     * bounds and the text cursor offset, and pass this data into SDL_SetTextInputArea.
-     * This is currently not possible to do safely as Nuklear does not support it.
-     * https://wiki.libsdl.org/SDL3/SDL_SetTextInputArea
-     * https://github.com/Immediate-Mode-UI/Nuklear/pull/857
-     */
-}
-
-NK_API nk_bool nk_sdl_render_needed(struct nk_context* ctx)
-{
-    static void* cmds_last = NULL;
-    static nk_size cmds_last_size = 0;
-
-    const void* cmds = nk_buffer_memory(&ctx->memory);
-    const nk_size cmds_size = ctx->memory.allocated;
-
-    if (cmds_size != cmds_last_size || 0 != memcmp(cmds_last, cmds, cmds_size))
-    {
-        if (cmds_size > cmds_last_size)
-        {
-            cmds_last = nk_sdl_alloc(ctx->userdata, cmds_last, cmds_size);
-        }
-
-        memcpy(cmds_last, cmds, cmds_size);
-        cmds_last_size = cmds_size;
-
-        return true;
-    }
-
-    nk_clear(ctx);
-    return false;
-}
-
-NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA)
-{
-    /* setup global state */
-    NK_ASSERT(ctx);
-    struct nk_sdl* sdl = ctx->userdata.ptr;
-    NK_ASSERT(sdl);
-
-    {
-        /* setup internal delta time that Nuklear needs for animations */
-        const Uint64 ticks = SDL_GetTicksNS();
-        ctx->delta_time_seconds = SDL_NS_TO_SECONDS((float)(ticks - sdl->last_render));
-        sdl->last_render = ticks;
-    }
-
-    {
-        const int vs = sizeof(struct nk_sdl_vertex);
-        const size_t vp = NK_OFFSETOF(struct nk_sdl_vertex, position);
-        const size_t vt = NK_OFFSETOF(struct nk_sdl_vertex, uv);
-        const size_t vc = NK_OFFSETOF(struct nk_sdl_vertex, col);
-
-        /* convert from command queue into draw list and draw to screen */
-        const struct nk_draw_command* cmd = { 0 };
-        const nk_draw_index* offset = NULL;
-        struct nk_buffer vbuf = { 0 };
-        struct nk_buffer ebuf = { 0 };
-
-        /* fill converting configuration */
-        static const struct nk_draw_vertex_layout_element vertex_layout[] = {
-            {NK_VERTEX_POSITION,    NK_FORMAT_FLOAT,                NK_OFFSETOF(struct nk_sdl_vertex, position)},
-            {NK_VERTEX_TEXCOORD,    NK_FORMAT_FLOAT,                NK_OFFSETOF(struct nk_sdl_vertex, uv)},
-            {NK_VERTEX_COLOR,       NK_FORMAT_R32G32B32A32_FLOAT,   NK_OFFSETOF(struct nk_sdl_vertex, col)},
-            {NK_VERTEX_LAYOUT_END}
-        };
-        ;
-        struct nk_convert_config config = {
-            .global_alpha = 1.0f,
-            .line_AA = AA,
-            .shape_AA = AA,
-            .circle_segment_count = 22,
-            .arc_segment_count = 22,
-            .curve_segment_count = 22,
-            .tex_null = sdl->ogl.tex_null,
-            .vertex_layout = vertex_layout,
-            .vertex_size = sizeof(struct nk_sdl_vertex),
-            .vertex_alignment = NK_ALIGNOF(struct nk_sdl_vertex),
-        };
-
-        /* convert shapes into vertices */
-        nk_buffer_init(&vbuf, &sdl->allocator, NK_BUFFER_DEFAULT_INITIAL_SIZE);
-        nk_buffer_init(&ebuf, &sdl->allocator, NK_BUFFER_DEFAULT_INITIAL_SIZE);
-        nk_convert(&sdl->ctx, &sdl->ogl.cmds, &vbuf, &ebuf, &config);
-
-        /* iterate over and execute each draw command */
-        offset = (const nk_draw_index*)nk_buffer_memory_const(&ebuf);
-
-        const bool clipping_enabled = SDL_RenderClipEnabled(sdl->renderer);
-        SDL_Rect saved_clip;
-        SDL_GetRenderClipRect(sdl->renderer, &saved_clip);
-
-        nk_draw_foreach(cmd, &sdl->ctx, &sdl->ogl.cmds)
-        {
-            if (!cmd->elem_count)
-            {
-                continue;
-            }
-
-            {
-                const SDL_Rect r = {
-                    .x = (int)cmd->clip_rect.x,
-                    .y = (int)cmd->clip_rect.y,
-                    .w = (int)cmd->clip_rect.w,
-                    .h = (int)cmd->clip_rect.h,
-                };
-                SDL_SetRenderClipRect(sdl->renderer, &r);
-            }
-
-            {
-                const void* vertices = nk_buffer_memory_const(&vbuf);
-
-                SDL_RenderGeometryRaw(
-                    sdl->renderer,
-                    cmd->texture.ptr,
-                    (const float*)((const nk_byte*)vertices + vp), vs,
-                    (const SDL_FColor*)((const nk_byte*)vertices + vc), vs,
-                    (const float*)((const nk_byte*)vertices + vt), vs,
-                    (int)(vbuf.needed / vs),
-                    (void*)offset,
-                    (int)cmd->elem_count,
-                    2
-                );
-
-                offset += cmd->elem_count;
-            }
-        }
-
-        SDL_SetRenderClipRect(sdl->renderer, &saved_clip);
-
-        if (!clipping_enabled)
-        {
-            SDL_SetRenderClipRect(sdl->renderer, NULL);
-        }
-
-        nk_buffer_clear(&sdl->ogl.cmds);
-        nk_buffer_free(&vbuf);
-        nk_buffer_free(&ebuf);
-        nk_clear(&sdl->ctx);
-    }
-}
-
-NK_INTERN void nk_sdl_clipboard_paste(const nk_handle usr, struct nk_text_edit* edit)
-{
-    NK_UNUSED(usr);
-
-    /* this function returns empty string on failure, not NULL */
-    char* text = SDL_GetClipboardText();
-
-    NK_ASSERT(text);
-
-    if ('\0' != text[0])
-    {
-        /* FIXME: there is a bug in Nuklear that affects UTF8 clipboard handling
-         * "len" should be a buffer length, but due to bug it must be a glyph count
-         * see: https://github.com/Immediate-Mode-UI/Nuklear/pull/841 */
-#if 0
-        const int len = nk_strlen(text);
-#else
-        const int len = (int)SDL_utf8strlen(text);
-#endif
-        nk_textedit_paste(edit, text, len);
-    }
-
-    SDL_free(text);
-}
-
-NK_INTERN void nk_sdl_clipboard_copy(const nk_handle usr, const char* text, const int len)
-{
-    struct nk_sdl* sdl = usr.ptr;
-    NK_ASSERT(sdl);
-
-    if (len <= 0 || NULL == text)
-    {
-        return;
-    }
-
-    /* FIXME: there is a bug in Nuklear that affects UTF8 clipboard handling
-     * "len" is expected to be a buffer length, but due to bug it actually is a glyph count
-     * see: https://github.com/Immediate-Mode-UI/Nuklear/pull/841 */
-#if 0
-    buflen = len + 1;
-    NK_UNUSED(ptext);
-#else
-    const char* ptext = text;
-
-    for (int i = len; i > 0; i--)
-    {
-        (void)SDL_StepUTF8(&ptext, NULL);
-    }
-
-    const size_t buflen = (size_t)(ptext - text) + 1;
-#endif
-
-    char* str = sdl->allocator.alloc(sdl->allocator.userdata, NULL, buflen);
-
-    if (NULL == str)
-    {
-        return;
-    }
-
-    SDL_strlcpy(str, text, buflen);
-    SDL_SetClipboardText(str);
-    sdl->allocator.free(sdl->allocator.userdata, str);
-}
-
-NK_API struct nk_context* nk_sdl_init(SDL_Window* window, SDL_Renderer* renderer, const struct nk_allocator allocator)
-{
-    NK_ASSERT(window);
-    NK_ASSERT(renderer);
-    NK_ASSERT(allocator.alloc);
-    NK_ASSERT(allocator.free);
-    struct nk_sdl* sdl = allocator.alloc(allocator.userdata, 0, sizeof(*sdl));
-    NK_ASSERT(sdl);
-    SDL_zerop(sdl);
-    sdl->allocator.userdata = allocator.userdata;
-    sdl->allocator.alloc = allocator.alloc;
-    sdl->allocator.free = allocator.free;
-    sdl->win = window;
-    sdl->renderer = renderer;
-    nk_init(&sdl->ctx, &sdl->allocator, NULL);
-    sdl->ctx.userdata = nk_handle_ptr(sdl);
-    sdl->ctx.clip.copy = nk_sdl_clipboard_copy;
-    sdl->ctx.clip.paste = nk_sdl_clipboard_paste;
-    sdl->ctx.clip.userdata = nk_handle_ptr(sdl);
-    nk_buffer_init(&sdl->ogl.cmds, &sdl->allocator, NK_BUFFER_DEFAULT_INITIAL_SIZE);
-    sdl->edit_was_active = false;
-    sdl->insert_toggle = false;
-
-    return &sdl->ctx;
-}
-
-#ifdef NK_INCLUDE_FONT_BAKING
-NK_API struct nk_font_atlas* nk_sdl_font_stash_begin(struct nk_context* ctx)
-{
-    NK_ASSERT(ctx);
-    struct nk_sdl* sdl = ctx->userdata.ptr;
-    NK_ASSERT(sdl);
-    nk_font_atlas_init(&sdl->atlas, &sdl->allocator);
-    nk_font_atlas_begin(&sdl->atlas);
-
-    return &sdl->atlas;
-}
-#endif
-
-#ifdef NK_INCLUDE_FONT_BAKING
-NK_API void nk_sdl_font_stash_end(struct nk_context* ctx)
-{
-    NK_ASSERT(ctx);
-    struct nk_sdl* sdl = ctx->userdata.ptr;
-    NK_ASSERT(sdl);
-    int w = 0;
-    int h = 0;
-    const void* image = nk_font_atlas_bake(&sdl->atlas, &w, &h, NK_FONT_ATLAS_RGBA32);
-    NK_ASSERT(image);
-    nk_sdl_device_upload_atlas(&sdl->ctx, image, w, h);
-    nk_font_atlas_end(&sdl->atlas, nk_handle_ptr(sdl->ogl.font_tex), &sdl->ogl.tex_null);
-
-    if (NULL != sdl->atlas.default_font)
-    {
-        nk_style_set_font(&sdl->ctx, &sdl->atlas.default_font->handle);
-    }
-}
-#endif
-
 NK_API int nk_sdl_handle_event(struct nk_context* ctx, SDL_Event *evt)
 {
     NK_ASSERT(ctx);
@@ -474,7 +430,7 @@ NK_API int nk_sdl_handle_event(struct nk_context* ctx, SDL_Event *evt)
     NK_ASSERT(sdl);
 
     /* We only care about Window currently used by Nuklear */
-    if (sdl->win != SDL_GetWindowFromEvent(evt))
+    if (sdl->window != SDL_GetWindowFromEvent(evt))
     {
         return 0;
     }
@@ -598,140 +554,480 @@ NK_API int nk_sdl_handle_event(struct nk_context* ctx, SDL_Event *evt)
     return 0;
 }
 
-NK_API void nk_sdl_shutdown(struct nk_context* ctx)
+NK_INTERN void nk_sdl_device_upload_atlas(struct nk_context* ctx, const void* image, const int width, const int height)
 {
+    NK_ASSERT(ctx);
+    NK_ASSERT(image);
+    NK_ASSERT(width > 0);
+    NK_ASSERT(height > 0);
+
+    struct nk_sdl* sdl = ctx->userdata.ptr;
+    NK_ASSERT(sdl);
+
+    /* Clean up if the texture already exists. */
+    if (NULL != sdl->device.font_texture)
+    {
+        SDL_ReleaseGPUTexture(sdl->device.gpu, sdl->device.font_texture);
+        sdl->device.font_texture = NULL;
+    }
+
+    const SDL_GPUTextureCreateInfo texture_create_info = {
+        .type = SDL_GPU_TEXTURETYPE_2D,
+        .format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+        .usage = SDL_GPU_TEXTUREUSAGE_GRAPHICS_STORAGE_READ,
+        .width = width,
+        .height = height,
+        .layer_count_or_depth = 1,
+        .num_levels = 1,
+        .sample_count = 0,
+        .props = 0,
+    };
+
+    sdl->device.font_texture = SDL_CreateGPUTexture(sdl->device.gpu, &texture_create_info);
+    NK_ASSERT(sdl->device.font_texture);
+
+    const int pitch = 4 * width;
+    const SDL_GPUTransferBufferCreateInfo transfer_buffer_create_info = {
+        .usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+        .size  = height * pitch,
+        .props = 0,
+    };
+
+    SDL_GPUTransferBuffer* font_tex_transfer_buffer = SDL_CreateGPUTransferBuffer(sdl->device.gpu, &transfer_buffer_create_info);
+    NK_ASSERT(font_tex_transfer_buffer);
+
+    void* font_fex_data = SDL_MapGPUTransferBuffer(sdl->device.gpu, font_tex_transfer_buffer, false);
+
+    SDL_memcpy(font_fex_data, image, transfer_buffer_create_info.size);
+
+    SDL_UnmapGPUTransferBuffer(sdl->device.gpu, font_tex_transfer_buffer);
+
+    SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(sdl->device.gpu);
+    NK_ASSERT(command_buffer);
+
+    SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(command_buffer);
+    {
+        const SDL_GPUTextureTransferInfo texture_transfer_info = {
+            .transfer_buffer = font_tex_transfer_buffer,
+            .offset          = 0,
+            .pixels_per_row  = width,
+            .rows_per_layer  = height,
+        };
+
+        const SDL_GPUTextureRegion texture_region = {
+            .texture = sdl->device.font_texture,
+            .mip_level = 0,
+            .layer = 0,
+            .x = 0,
+            .y = 0,
+            .z = 0,
+            .w = width,
+            .h = height,
+            .d = 1,
+        };
+        SDL_UploadToGPUTexture(copy_pass, &texture_transfer_info, &texture_region, false);
+    }
+    SDL_EndGPUCopyPass(copy_pass);
+
+    // submit command buffer
+    const bool success = SDL_SubmitGPUCommandBuffer(command_buffer);
+    if (!success)
+    {
+        fprintf(stderr, "%s\n", SDL_GetError());
+    }
+    NK_ASSERT(success);
+
+    SDL_ReleaseGPUTransferBuffer(sdl->device.gpu, font_tex_transfer_buffer);
+}
+
+NK_API nk_bool nk_sdl_render_needed(struct nk_context* ctx)
+{
+    static void* cmds_last = NULL;
+    static nk_size cmds_last_size = 0;
+
+    const void* cmds = nk_buffer_memory(&ctx->memory);
+    const nk_size cmds_size = ctx->memory.allocated;
+
+    if (cmds_size != cmds_last_size || 0 != memcmp(cmds_last, cmds, cmds_size))
+    {
+        if (cmds_size > cmds_last_size)
+        {
+            cmds_last = nk_sdl_alloc(ctx->userdata, cmds_last, cmds_size);
+        }
+
+        memcpy(cmds_last, cmds, cmds_size);
+        cmds_last_size = cmds_size;
+
+        return true;
+    }
+
+    nk_clear(ctx);
+    return false;
+}
+
+NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA, const struct nk_colorf color)
+{
+    /* setup global state */
     NK_ASSERT(ctx);
     struct nk_sdl* sdl = ctx->userdata.ptr;
     NK_ASSERT(sdl);
 
-#ifdef NK_INCLUDE_FONT_BAKING
-    if (sdl->atlas.font_num > 0)
     {
-        nk_font_atlas_clear(&sdl->atlas);
+        /* setup internal delta time that Nuklear needs for animations */
+        const Uint64 ticks = SDL_GetTicksNS();
+        ctx->delta_time_seconds = SDL_NS_TO_SECONDS((float)(ticks - sdl->last_render));
+        sdl->last_render = ticks;
     }
+
+    {
+        /* load draw vertices & elements directly into vertex + element buffer */
+        {
+            /* Wait until GPU is done with buffer */
+            void* transfer_buffer_data = SDL_MapGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer, false);
+            NK_ASSERT(transfer_buffer_data);
+
+            /* fill converting configuration */
+            static const struct nk_draw_vertex_layout_element vertex_layout[] = {
+                {NK_VERTEX_POSITION,    NK_FORMAT_FLOAT,              NK_OFFSETOF(struct nk_sdl_vertex, position)},
+                {NK_VERTEX_TEXCOORD,    NK_FORMAT_FLOAT,              NK_OFFSETOF(struct nk_sdl_vertex, uv)      },
+                {NK_VERTEX_COLOR,       NK_FORMAT_R32G32B32A32_FLOAT, NK_OFFSETOF(struct nk_sdl_vertex, col)     },
+                {NK_VERTEX_LAYOUT_END}
+            };
+            const struct nk_convert_config config = {
+                .global_alpha = 1.0f,
+                .line_AA = AA,
+                .shape_AA = AA,
+                .circle_segment_count = 22,
+                .arc_segment_count = 22,
+                .curve_segment_count = 22,
+                .tex_null = sdl->device.tex_null,
+                .vertex_layout = vertex_layout,
+                .vertex_size = sizeof(struct nk_sdl_vertex),
+                .vertex_alignment = NK_ALIGNOF(struct nk_sdl_vertex),
+            };
+
+            memset(transfer_buffer_data, 0, sdl->device.buffer_vertex_max + sdl->device.buffer_index_max);
+            struct nk_sdl_vertex* vertices = transfer_buffer_data;
+            Uint16* indices = transfer_buffer_data + (size_t)sdl->device.buffer_vertex_max;
+
+            /* setup buffers to load vertices and elements */
+            struct nk_buffer vbuf = { 0 };
+            struct nk_buffer ebuf = { 0 };
+            nk_buffer_init_fixed(&vbuf, vertices, (size_t)sdl->device.buffer_vertex_max);
+            nk_buffer_init_fixed(&ebuf, indices, (size_t)sdl->device.buffer_index_max);
+            nk_convert(ctx, &sdl->device.cmds, &vbuf, &ebuf, &config);
+
+            SDL_UnmapGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer);
+
+            SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(sdl->device.gpu);
+            NK_ASSERT(command_buffer);
+
+            SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(command_buffer);
+            {
+                // copy vertex data
+                const SDL_GPUTransferBufferLocation gpu_transfer_buffer_location_vertex = {
+                    .transfer_buffer = sdl->device.buffer_transfer,
+                    .offset = 0,
+                };
+                const SDL_GPUBufferRegion gpu_transfer_buffer_region_vertex = {
+                    .buffer = sdl->device.buffer_vertex,
+                    .offset = 0,
+                    .size   = sdl->device.buffer_vertex_max
+                };
+                SDL_UploadToGPUBuffer(copy_pass, &gpu_transfer_buffer_location_vertex, &gpu_transfer_buffer_region_vertex, false);
+
+                // copy index data
+                const SDL_GPUTransferBufferLocation gpu_transfer_buffer_location_index = {
+                    .transfer_buffer = sdl->device.buffer_transfer,
+                    .offset          = sdl->device.buffer_vertex_max,
+                };
+                const SDL_GPUBufferRegion gpu_transfer_buffer_region_index = {
+                    .buffer = sdl->device.buffer_index,
+                    .offset = 0,
+                    .size   = sdl->device.buffer_index_max,
+                };
+                SDL_UploadToGPUBuffer(copy_pass, &gpu_transfer_buffer_location_index, &gpu_transfer_buffer_region_index, false);
+            }
+            SDL_EndGPUCopyPass(copy_pass);
+
+            // submit command buffer
+            const bool success = SDL_SubmitGPUCommandBuffer(command_buffer);
+            NK_ASSERT(success);
+        }
+
+        float window_width = 0.0f;
+        float window_height = 0.0f;
+        {
+            int w;
+            int h;
+            const bool success = SDL_GetWindowSize(sdl->window, &w, &h);
+            NK_ASSERT(success);
+            window_width = (float)w;
+            window_height = (float)h;
+        }
+
+        float projection_orthographic[4][4] = {
+            {  2.0f,  0.0f,  0.0f,  0.0f },
+            {  0.0f, -2.0f,  0.0f,  0.0f },
+            {  0.0f,  0.0f, -1.0f,  0.0f },
+            { -1.0f,  1.0f,  0.0f,  1.0f },
+        };
+        projection_orthographic[0][0] = projection_orthographic[0][0] / window_width;
+        projection_orthographic[1][1] = projection_orthographic[1][1] / window_height;
+
+        /* convert from command queue into draw list and draw to screen */
+
+        /* convert shapes into vertices */
+
+        /* iterate over and execute each draw command */
+
+        SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(sdl->device.gpu);
+        NK_ASSERT(command_buffer);
+
+        SDL_GPUTexture* swapchain_texture = NULL;
+        NK_ASSERT(SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, sdl->window, &swapchain_texture, NULL, NULL));
+
+        if (NULL != swapchain_texture)
+        {
+            const SDL_GPUColorTargetInfo color_target_info = {
+                .texture = swapchain_texture,
+                .mip_level = 0,
+                .layer_or_depth_plane = 0,
+                .clear_color = { .r = color.r, .g = color.g, .b = color.b, .a = color.a },
+                .load_op = SDL_GPU_LOADOP_CLEAR,
+                .store_op = SDL_GPU_STOREOP_STORE,
+                .resolve_texture = NULL,
+                .resolve_mip_level = 0,
+                .resolve_layer = 0,
+                .cycle = false,
+                .cycle_resolve_texture = false,
+            };
+
+            SDL_GPURenderPass* render_pass = SDL_BeginGPURenderPass(command_buffer, &color_target_info, 1, NULL);
+            {
+                // bind vertex buffer
+                const SDL_GPUBufferBinding buffer_vertex_binding = { .buffer = sdl->device.buffer_vertex, .offset = 0, };
+                SDL_BindGPUVertexBuffers(render_pass, 0, &buffer_vertex_binding, 1);
+
+                // bind index buffer
+                const SDL_GPUBufferBinding buffer_index_binding = { .buffer = sdl->device.buffer_index, .offset = 0, };
+                SDL_BindGPUIndexBuffer(render_pass, &buffer_index_binding, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+
+                // bind graphics pipeline
+                SDL_BindGPUGraphicsPipeline(render_pass, sdl->device.pipeline);
+
+                // push vertex uniform
+                SDL_PushGPUVertexUniformData(command_buffer, 0, projection_orthographic, sizeof(projection_orthographic));
+
+                // bind gpu fragment texture
+                SDL_BindGPUFragmentStorageTextures(render_pass, 0, &sdl->device.font_texture, 1);
+
+                // push fragment texture sampler
+                const SDL_GPUTextureSamplerBinding texture_sampler_binding = {
+                    .texture = sdl->device.font_texture,
+                    .sampler = sdl->device.font_sampler,
+                };
+                SDL_BindGPUFragmentSamplers(render_pass, 0, &texture_sampler_binding, 1);
+
+                Uint32 offset = 0;
+                const struct nk_draw_command* cmd = { 0 };
+
+                nk_draw_foreach(cmd, &sdl->ctx, &sdl->device.cmds)
+                {
+                    if (0 == cmd->elem_count)
+                    {
+                        continue;
+                    }
+
+                    // scissor
+                    {
+                        const SDL_Rect r = {
+                            .x = (int)cmd->clip_rect.x,
+                            .y = (int)cmd->clip_rect.y,
+                            .w = (int)cmd->clip_rect.w,
+                            .h = (int)cmd->clip_rect.h,
+                        };
+                        SDL_SetGPUScissor(render_pass, &r);
+                    }
+
+                    // draw
+                    SDL_DrawGPUIndexedPrimitives(render_pass, cmd->elem_count, 1, offset, 0, 0);
+                    offset += (Uint32)cmd->elem_count;
+                }
+            }
+            SDL_EndGPURenderPass(render_pass);
+        }
+        SDL_SubmitGPUCommandBuffer(command_buffer);
+
+        nk_buffer_clear(&sdl->device.cmds);
+        nk_clear(&sdl->ctx);
+    }
+}
+
+NK_INTERN void nk_sdl_clipboard_paste(const nk_handle usr, struct nk_text_edit* edit)
+{
+    NK_UNUSED(usr);
+
+    /* this function returns empty string on failure, not NULL */
+    char* text = SDL_GetClipboardText();
+
+    NK_ASSERT(text);
+
+    if ('\0' != text[0])
+    {
+        /* FIXME: there is a bug in Nuklear that affects UTF8 clipboard handling
+         * "len" should be a buffer length, but due to bug it must be a glyph count
+         * see: https://github.com/Immediate-Mode-UI/Nuklear/pull/841 */
+#if 0
+        const int len = nk_strlen(text);
+#else
+        const int len = (int)SDL_utf8strlen(text);
+#endif
+        nk_textedit_paste(edit, text, len);
+    }
+
+    SDL_free(text);
+}
+
+NK_INTERN void nk_sdl_clipboard_copy(const nk_handle usr, const char* text, const int len)
+{
+    struct nk_sdl* sdl = usr.ptr;
+    NK_ASSERT(sdl);
+
+    if (len <= 0 || NULL == text)
+    {
+        return;
+    }
+
+    /* FIXME: there is a bug in Nuklear that affects UTF8 clipboard handling
+     * "len" is expected to be a buffer length, but due to bug it actually is a glyph count
+     * see: https://github.com/Immediate-Mode-UI/Nuklear/pull/841 */
+#if 0
+    buflen = len + 1;
+    NK_UNUSED(ptext);
+#else
+    const char* ptext = text;
+
+    for (int i = len; i > 0; i--)
+    {
+        (void)SDL_StepUTF8(&ptext, NULL);
+    }
+
+    const size_t buflen = (size_t)(ptext - text) + 1;
 #endif
 
-    nk_buffer_free(&sdl->ogl.cmds);
+    char* str = sdl->allocator.alloc(sdl->allocator.userdata, NULL, buflen);
 
-    if (NULL != sdl->ogl.font_tex)
+    if (NULL == str)
     {
-        SDL_DestroyTexture(sdl->ogl.font_tex);
-        sdl->ogl.font_tex = NULL;
+        return;
     }
 
-    nk_free(ctx);
-    sdl->allocator.free(sdl->allocator.userdata, sdl->debug_font);
-    sdl->allocator.free(sdl->allocator.userdata, sdl);
+    SDL_strlcpy(str, text, buflen);
+    SDL_SetClipboardText(str);
+    sdl->allocator.free(sdl->allocator.userdata, str);
 }
 
-/* Debug Font Width/Height of internal texture atlas
- * This is a result of: ceil(sqrt('~' - ' '))
- * There is a sanity check for this value in nk_sdl_style_set_debug_font */
-#define NK_SDL_DFWH (10)
-
-NK_INTERN float nk_sdl_query_debug_font_width(const nk_handle handle, const float height, const char *text, const int len)
-{
-    NK_UNUSED(handle);
-    return (float)nk_utf_len(text, len) * height;
-}
-
-NK_INTERN void nk_sdl_query_debug_font_glyph(const nk_handle handle, const float height, struct nk_user_font_glyph* glyph, const nk_rune codepoint, const nk_rune next_codepoint)
-{
-    NK_UNUSED(next_codepoint);
-    NK_UNUSED(handle);
-
-    /* replace non-ASCII characters with question mark */
-    const char ascii = (codepoint < (nk_rune)' ' || codepoint > (nk_rune)'~') ? '?' : (char)codepoint;
-    NK_ASSERT(ascii >= ' ' && ascii <= '~');
-
-    const int idx = (ascii - ' ');
-    const int x   = idx / NK_SDL_DFWH;
-    const int y   = idx % NK_SDL_DFWH;
-    NK_ASSERT(x >= 0 && x < NK_SDL_DFWH);
-    NK_ASSERT(y >= 0 && y < NK_SDL_DFWH);
-
-    glyph->height = height;
-    glyph->width = height;
-    glyph->xadvance = height;
-    glyph->uv[0].x = (float)(x + 0) / NK_SDL_DFWH;
-    glyph->uv[0].y = (float)(y + 0) / NK_SDL_DFWH;
-    glyph->uv[1].x = (float)(x + 1) / NK_SDL_DFWH;
-    glyph->uv[1].y = (float)(y + 1) / NK_SDL_DFWH;
-    glyph->offset.x = 0.0f;
-    glyph->offset.y = 0.0f;
-}
-
-NK_API void nk_sdl_style_set_debug_font(struct nk_context* ctx)
+NK_API void nk_sdl_update_text_input(struct nk_context* ctx)
 {
     NK_ASSERT(ctx);
-
     struct nk_sdl* sdl = ctx->userdata.ptr;
     NK_ASSERT(sdl);
 
-    if (NULL != sdl->debug_font)
+    /* Determine if Nuklear is using any top-level "edit" widget.
+     * Popups take higher priority because they block any incomming input.
+     * This will not work, if the widget is not updating context state properly. */
+    bool active;
+    if (NULL == ctx->active)
     {
-        sdl->allocator.free(sdl->allocator.userdata, sdl->debug_font);
-        sdl->debug_font = NULL;
+        active = false;
+    }
+    else if (NULL != ctx->active->popup.win)
+    {
+        active = ctx->active->popup.win->edit.active;
+    }
+    else
+    {
+        active = ctx->active->edit.active;
     }
 
-    /* sanity check: formal proof of NK_SDL_DFWH value (which is 10) */
-    NK_ASSERT(SDL_ceil(SDL_sqrt('~' - ' ')) == NK_SDL_DFWH);
-
-    /* We use another Software Renderer just to make sure
-     * that we won't mutate any state in the main Renderer. */
-    SDL_Surface* surface = SDL_CreateSurface(
-        NK_SDL_DFWH * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE,
-        NK_SDL_DFWH * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE,
-        SDL_PIXELFORMAT_RGBA32
-    );
-    NK_ASSERT(surface);
-    SDL_Renderer* renderer = SDL_CreateSoftwareRenderer(surface);
-    NK_ASSERT(renderer);
-    bool success = SDL_SetRenderDrawColor(renderer, 0xFF, 0xFF, 0xFF, 0xFF);
-    NK_ASSERT(success);
-
-    /* SPACE is the first printable ASCII character */
-    char buf[2];
-    NK_MEMCPY(buf, " ", sizeof(buf));
-    for (int x = 0; x < NK_SDL_DFWH; x++)
+    /* decide, if TextInputActive should be unchanged/stoped/started
+     * and change its state accordingly for owned SDL Window */
+    if (active != sdl->edit_was_active)
     {
-        for (int y = 0; y < NK_SDL_DFWH; y++)
+        const bool window_edit_active = SDL_TextInputActive(sdl->window);
+
+        /* If you ever hit this check, it means that the demo and your app
+         * (or something else) are all trying to manage TextInputActive state.
+         * This can cause subtle bugs where the state won't be what you expect.
+         * You can safely remove this assert and the demo will keep working,
+         * but make sure it does not cause any issues for you */
+        NK_ASSERT(window_edit_active == sdl->edit_was_active && "something else changed TextInputActive state for this Window");
+
+        if (!window_edit_active && !sdl->edit_was_active && active)
         {
-            success = SDL_RenderDebugText(
-                renderer,
-                (float)(x * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE),
-                (float)(y * SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE),
-                buf
-            );
-            NK_ASSERT(success);
-            ++buf[0];
-
-            /* TILDE is the last printable ASCII character */
-            if (buf[0] > '~')
-            {
-                break;
-            }
+            SDL_StartTextInput(sdl->window);
         }
+        else if (window_edit_active && sdl->edit_was_active && !active)
+        {
+            SDL_StopTextInput(sdl->window);
+        }
+
+        sdl->edit_was_active = active;
     }
-    success = SDL_RenderPresent(renderer);
-    NK_ASSERT(success);
 
-    struct nk_user_font* font = sdl->allocator.alloc(sdl->allocator.userdata, NULL, sizeof(*font));
-    NK_ASSERT(font);
-    font->userdata.ptr = sdl;
-    font->height = SDL_DEBUG_TEXT_FONT_CHARACTER_SIZE;
-    font->width = &nk_sdl_query_debug_font_width;
-    font->query = &nk_sdl_query_debug_font_glyph;
-
-    /* HACK: nk_sdl_device_upload_atlas turns pixels into SDL_Texture
-     *       and sets said Texture into sdl->ogl.font_tex
-     *       then nk_sdl_render expects same Texture at font->texture */
-    nk_sdl_device_upload_atlas(ctx, surface->pixels, surface->w, surface->h);
-    font->texture.ptr = sdl->ogl.font_tex;
-
-    sdl->debug_font = font;
-    nk_style_set_font(ctx, font);
-
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroySurface(surface);
+    /* FIXME:
+     * for full SDL3 integration, you also need to find current edit widget
+     * bounds and the text cursor offset, and pass this data into SDL_SetTextInputArea.
+     * This is currently not possible to do safely as Nuklear does not support it.
+     * https://wiki.libsdl.org/SDL3/SDL_SetTextInputArea
+     * https://github.com/Immediate-Mode-UI/Nuklear/pull/857
+     */
 }
+
+NK_API nk_handle nk_sdl_get_userdata(const struct nk_context* ctx)
+{
+    NK_ASSERT(ctx);
+    struct nk_sdl* sdl = ctx->userdata.ptr;
+    NK_ASSERT(sdl);
+    return sdl->userdata;
+}
+
+NK_API void nk_sdl_set_userdata(struct nk_context* ctx, const nk_handle userdata)
+{
+    NK_ASSERT(ctx);
+    struct nk_sdl* sdl = ctx->userdata.ptr;
+    NK_ASSERT(sdl);
+    sdl->userdata = userdata;
+}
+
+#ifdef NK_INCLUDE_FONT_BAKING
+NK_API struct nk_font_atlas* nk_sdl_font_stash_begin(struct nk_context* ctx)
+{
+    NK_ASSERT(ctx);
+    struct nk_sdl* sdl = ctx->userdata.ptr;
+    NK_ASSERT(sdl);
+    nk_font_atlas_init(&sdl->atlas, &sdl->allocator);
+    nk_font_atlas_begin(&sdl->atlas);
+
+    return &sdl->atlas;
+}
+
+NK_API void nk_sdl_font_stash_end(struct nk_context* ctx)
+{
+    NK_ASSERT(ctx);
+    struct nk_sdl* sdl = ctx->userdata.ptr;
+    NK_ASSERT(sdl);
+    int w = 0;
+    int h = 0;
+    const void* image = nk_font_atlas_bake(&sdl->atlas, &w, &h, NK_FONT_ATLAS_RGBA32);
+    NK_ASSERT(image);
+    nk_sdl_device_upload_atlas(&sdl->ctx, image, w, h);
+    nk_font_atlas_end(&sdl->atlas, nk_handle_ptr(sdl->device.font_texture), &sdl->device.tex_null);
+
+    if (NULL != sdl->atlas.default_font)
+    {
+        nk_style_set_font(&sdl->ctx, &sdl->atlas.default_font->handle);
+    }
+}
+#endif // NK_INCLUDE_FONT_BAKING

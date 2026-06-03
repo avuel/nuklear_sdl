@@ -16,14 +16,8 @@
 #define NK_INCLUDE_STANDARD_VARARGS
 #define NK_INCLUDE_STANDARD_IO
 
-/* note that sdl3_renderer comes with nk_sdl_style_set_debug_font()
- * so you may wish to use that instead of font baking */
 #define NK_INCLUDE_FONT_BAKING
 #define NK_INCLUDE_DEFAULT_FONT
-
-/* note that sdl3_renderer comes with nk_sdl_allocator()
- * and you probably want to use that allocator instead of the default ones */
-/*#define NK_INCLUDE_DEFAULT_ALLOCATOR*/
 
 /* mandatory: sdl3_renderer depends on those defines */
 #define NK_INCLUDE_COMMAND_USERDATA
@@ -31,7 +25,6 @@
 
 /* We can re-use the types provided by SDL which are extremely portable,
  * so there is no need for Nuklear to detect those on its own */
-/*#define NK_INCLUDE_FIXED_TYPES*/
 #ifndef NK_INCLUDE_FIXED_TYPES
     #define NK_INT8              Sint8
     #define NK_UINT8             Uint8
@@ -42,13 +35,12 @@
     /* SDL guarantees 'uintptr_t' typedef */
     #define NK_SIZE_TYPE         uintptr_t
     #define NK_POINTER_TYPE      uintptr_t
-#endif
+#endif // NK_INCLUDE_FIXED_TYPES
 
 /* We can reuse the `bool` symbol because SDL3 guarantees its existence */
-/*#define NK_INCLUDE_STANDARD_BOOL*/
 #ifndef NK_INCLUDE_STANDARD_BOOL
     #define NK_BOOL               bool
-#endif
+#endif // NK_INCLUDE_STANDARD_BOOL
 
 /* We can re-use various portable libc functions provided by SDL */
 #define NK_ASSERT(condition)      SDL_assert(condition)
