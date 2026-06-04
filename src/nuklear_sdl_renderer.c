@@ -69,13 +69,14 @@ struct nk_sdl_device {
     SDL_GPUGraphicsPipeline* pipeline;
     SDL_GPUBuffer* buffer_vertex;
     SDL_GPUBuffer* buffer_index;
-    SDL_GPUTransferBuffer* buffer_transfer;
     int buffer_vertex_max;
     int buffer_index_max;
-    struct nk_buffer cmds;
-    struct nk_draw_null_texture tex_null;
+    SDL_GPUTransferBuffer* buffer_transfer;
+    SDL_GPUFence* fence;
     SDL_GPUTexture* font_texture;
     SDL_GPUSampler* font_sampler;
+    struct nk_draw_null_texture tex_null;
+    struct nk_buffer cmds;
 };
 
 struct nk_sdl_vertex {
@@ -332,6 +333,14 @@ NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
 
 NK_INTERN void nk_sdl_device_destroy(struct nk_sdl* sdl)
 {
+    if (NULL != sdl->device.fence)
+    {
+        const bool success = SDL_WaitForGPUFences(sdl->device.gpu, true, &sdl->device.fence, 1);
+        NK_ASSERT(success);
+        SDL_ReleaseGPUFence(sdl->device.gpu, sdl->device.fence);
+        sdl->device.fence = NULL;
+    }
+
     if (NULL != sdl->device.font_sampler)
     {
         SDL_ReleaseGPUSampler(sdl->device.gpu, sdl->device.font_sampler);
@@ -679,189 +688,196 @@ NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA
         sdl->last_render = ticks;
     }
 
+    if (NULL != sdl->device.fence)
     {
-        /* load draw vertices & elements directly into vertex + element buffer */
-        {
-            /* Wait until GPU is done with buffer */
-            void* transfer_buffer_data = SDL_MapGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer, false);
-            NK_ASSERT(transfer_buffer_data);
+        // wait for last frame to submit
+        const bool success = SDL_WaitForGPUFences(sdl->device.gpu, true, &sdl->device.fence, 1);
+        NK_ASSERT(success);
+        SDL_ReleaseGPUFence(sdl->device.gpu, sdl->device.fence);
+        sdl->device.fence = NULL;
+    }
 
-            /* fill converting configuration */
-            static const struct nk_draw_vertex_layout_element vertex_layout[] = {
-                {NK_VERTEX_POSITION,    NK_FORMAT_FLOAT,              NK_OFFSETOF(struct nk_sdl_vertex, position)},
-                {NK_VERTEX_TEXCOORD,    NK_FORMAT_FLOAT,              NK_OFFSETOF(struct nk_sdl_vertex, uv)      },
-                {NK_VERTEX_COLOR,       NK_FORMAT_R32G32B32A32_FLOAT, NK_OFFSETOF(struct nk_sdl_vertex, col)     },
-                {NK_VERTEX_LAYOUT_END}
-            };
-            const struct nk_convert_config config = {
-                .global_alpha = 1.0f,
-                .line_AA = AA,
-                .shape_AA = AA,
-                .circle_segment_count = 22,
-                .arc_segment_count = 22,
-                .curve_segment_count = 22,
-                .tex_null = sdl->device.tex_null,
-                .vertex_layout = vertex_layout,
-                .vertex_size = sizeof(struct nk_sdl_vertex),
-                .vertex_alignment = NK_ALIGNOF(struct nk_sdl_vertex),
-            };
+    /* load draw vertices & elements directly into vertex + element buffer */
+    {
+        /* Wait until GPU is done with buffer */
+        void* transfer_buffer_data = SDL_MapGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer, false);
+        NK_ASSERT(transfer_buffer_data);
 
-            memset(transfer_buffer_data, 0, sdl->device.buffer_vertex_max + sdl->device.buffer_index_max);
-            struct nk_sdl_vertex* vertices = transfer_buffer_data;
-            Uint16* indices = transfer_buffer_data + (size_t)sdl->device.buffer_vertex_max;
-
-            /* setup buffers to load vertices and elements */
-            struct nk_buffer vbuf = { 0 };
-            struct nk_buffer ebuf = { 0 };
-            nk_buffer_init_fixed(&vbuf, vertices, (size_t)sdl->device.buffer_vertex_max);
-            nk_buffer_init_fixed(&ebuf, indices, (size_t)sdl->device.buffer_index_max);
-            nk_convert(ctx, &sdl->device.cmds, &vbuf, &ebuf, &config);
-
-            SDL_UnmapGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer);
-
-            SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(sdl->device.gpu);
-            NK_ASSERT(command_buffer);
-
-            SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(command_buffer);
-            {
-                // copy vertex data
-                const SDL_GPUTransferBufferLocation gpu_transfer_buffer_location_vertex = {
-                    .transfer_buffer = sdl->device.buffer_transfer,
-                    .offset = 0,
-                };
-                const SDL_GPUBufferRegion gpu_transfer_buffer_region_vertex = {
-                    .buffer = sdl->device.buffer_vertex,
-                    .offset = 0,
-                    .size   = sdl->device.buffer_vertex_max
-                };
-                SDL_UploadToGPUBuffer(copy_pass, &gpu_transfer_buffer_location_vertex, &gpu_transfer_buffer_region_vertex, false);
-
-                // copy index data
-                const SDL_GPUTransferBufferLocation gpu_transfer_buffer_location_index = {
-                    .transfer_buffer = sdl->device.buffer_transfer,
-                    .offset          = sdl->device.buffer_vertex_max,
-                };
-                const SDL_GPUBufferRegion gpu_transfer_buffer_region_index = {
-                    .buffer = sdl->device.buffer_index,
-                    .offset = 0,
-                    .size   = sdl->device.buffer_index_max,
-                };
-                SDL_UploadToGPUBuffer(copy_pass, &gpu_transfer_buffer_location_index, &gpu_transfer_buffer_region_index, false);
-            }
-            SDL_EndGPUCopyPass(copy_pass);
-
-            // submit command buffer
-            const bool success = SDL_SubmitGPUCommandBuffer(command_buffer);
-            NK_ASSERT(success);
-        }
-
-        float window_width = 0.0f;
-        float window_height = 0.0f;
-        {
-            int w;
-            int h;
-            const bool success = SDL_GetWindowSize(sdl->window, &w, &h);
-            NK_ASSERT(success);
-            window_width = (float)w;
-            window_height = (float)h;
-        }
-
-        float projection_orthographic[4][4] = {
-            {  2.0f,  0.0f,  0.0f,  0.0f },
-            {  0.0f, -2.0f,  0.0f,  0.0f },
-            {  0.0f,  0.0f, -1.0f,  0.0f },
-            { -1.0f,  1.0f,  0.0f,  1.0f },
+        /* fill converting configuration */
+        static const struct nk_draw_vertex_layout_element vertex_layout[] = {
+            {NK_VERTEX_POSITION,    NK_FORMAT_FLOAT,              NK_OFFSETOF(struct nk_sdl_vertex, position)},
+            {NK_VERTEX_TEXCOORD,    NK_FORMAT_FLOAT,              NK_OFFSETOF(struct nk_sdl_vertex, uv)      },
+            {NK_VERTEX_COLOR,       NK_FORMAT_R32G32B32A32_FLOAT, NK_OFFSETOF(struct nk_sdl_vertex, col)     },
+            {NK_VERTEX_LAYOUT_END}
         };
-        projection_orthographic[0][0] = projection_orthographic[0][0] / window_width;
-        projection_orthographic[1][1] = projection_orthographic[1][1] / window_height;
+        const struct nk_convert_config config = {
+            .global_alpha = 1.0f,
+            .line_AA = AA,
+            .shape_AA = AA,
+            .circle_segment_count = 22,
+            .arc_segment_count = 22,
+            .curve_segment_count = 22,
+            .tex_null = sdl->device.tex_null,
+            .vertex_layout = vertex_layout,
+            .vertex_size = sizeof(struct nk_sdl_vertex),
+            .vertex_alignment = NK_ALIGNOF(struct nk_sdl_vertex),
+        };
 
-        /* convert from command queue into draw list and draw to screen */
+        memset(transfer_buffer_data, 0, sdl->device.buffer_vertex_max + sdl->device.buffer_index_max);
+        struct nk_sdl_vertex* vertices = transfer_buffer_data;
+        Uint16* indices = transfer_buffer_data + (size_t)sdl->device.buffer_vertex_max;
 
-        /* convert shapes into vertices */
+        /* setup buffers to load vertices and elements */
+        struct nk_buffer vbuf = { 0 };
+        struct nk_buffer ebuf = { 0 };
+        nk_buffer_init_fixed(&vbuf, vertices, (size_t)sdl->device.buffer_vertex_max);
+        nk_buffer_init_fixed(&ebuf, indices, (size_t)sdl->device.buffer_index_max);
+        nk_convert(ctx, &sdl->device.cmds, &vbuf, &ebuf, &config);
 
-        /* iterate over and execute each draw command */
+        SDL_UnmapGPUTransferBuffer(sdl->device.gpu, sdl->device.buffer_transfer);
 
         SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(sdl->device.gpu);
         NK_ASSERT(command_buffer);
 
-        SDL_GPUTexture* swapchain_texture = NULL;
-        NK_ASSERT(SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, sdl->window, &swapchain_texture, NULL, NULL));
-
-        if (NULL != swapchain_texture)
+        SDL_GPUCopyPass* copy_pass = SDL_BeginGPUCopyPass(command_buffer);
         {
-            const SDL_GPUColorTargetInfo color_target_info = {
-                .texture = swapchain_texture,
-                .mip_level = 0,
-                .layer_or_depth_plane = 0,
-                .clear_color = { .r = color.r, .g = color.g, .b = color.b, .a = color.a },
-                .load_op = SDL_GPU_LOADOP_CLEAR,
-                .store_op = SDL_GPU_STOREOP_STORE,
-                .resolve_texture = NULL,
-                .resolve_mip_level = 0,
-                .resolve_layer = 0,
-                .cycle = false,
-                .cycle_resolve_texture = false,
+            // copy vertex data
+            const SDL_GPUTransferBufferLocation gpu_transfer_buffer_location_vertex = {
+                .transfer_buffer = sdl->device.buffer_transfer,
+                .offset = 0,
             };
+            const SDL_GPUBufferRegion gpu_transfer_buffer_region_vertex = {
+                .buffer = sdl->device.buffer_vertex,
+                .offset = 0,
+                .size   = sdl->device.buffer_vertex_max
+            };
+            SDL_UploadToGPUBuffer(copy_pass, &gpu_transfer_buffer_location_vertex, &gpu_transfer_buffer_region_vertex, false);
 
-            SDL_GPURenderPass* render_pass = SDL_BeginGPURenderPass(command_buffer, &color_target_info, 1, NULL);
-            {
-                // bind vertex buffer
-                const SDL_GPUBufferBinding buffer_vertex_binding = { .buffer = sdl->device.buffer_vertex, .offset = 0, };
-                SDL_BindGPUVertexBuffers(render_pass, 0, &buffer_vertex_binding, 1);
-
-                // bind index buffer
-                const SDL_GPUBufferBinding buffer_index_binding = { .buffer = sdl->device.buffer_index, .offset = 0, };
-                SDL_BindGPUIndexBuffer(render_pass, &buffer_index_binding, SDL_GPU_INDEXELEMENTSIZE_16BIT);
-
-                // bind graphics pipeline
-                SDL_BindGPUGraphicsPipeline(render_pass, sdl->device.pipeline);
-
-                // push vertex uniform
-                SDL_PushGPUVertexUniformData(command_buffer, 0, projection_orthographic, sizeof(projection_orthographic));
-
-                // bind gpu fragment texture
-                SDL_BindGPUFragmentStorageTextures(render_pass, 0, &sdl->device.font_texture, 1);
-
-                // push fragment texture sampler
-                const SDL_GPUTextureSamplerBinding texture_sampler_binding = {
-                    .texture = sdl->device.font_texture,
-                    .sampler = sdl->device.font_sampler,
-                };
-                SDL_BindGPUFragmentSamplers(render_pass, 0, &texture_sampler_binding, 1);
-
-                Uint32 offset = 0;
-                const struct nk_draw_command* cmd = { 0 };
-
-                nk_draw_foreach(cmd, &sdl->ctx, &sdl->device.cmds)
-                {
-                    if (0 == cmd->elem_count)
-                    {
-                        continue;
-                    }
-
-                    // scissor
-                    {
-                        const SDL_Rect r = {
-                            .x = (int)cmd->clip_rect.x,
-                            .y = (int)cmd->clip_rect.y,
-                            .w = (int)cmd->clip_rect.w,
-                            .h = (int)cmd->clip_rect.h,
-                        };
-                        SDL_SetGPUScissor(render_pass, &r);
-                    }
-
-                    // draw
-                    SDL_DrawGPUIndexedPrimitives(render_pass, cmd->elem_count, 1, offset, 0, 0);
-                    offset += (Uint32)cmd->elem_count;
-                }
-            }
-            SDL_EndGPURenderPass(render_pass);
+            // copy index data
+            const SDL_GPUTransferBufferLocation gpu_transfer_buffer_location_index = {
+                .transfer_buffer = sdl->device.buffer_transfer,
+                .offset          = sdl->device.buffer_vertex_max,
+            };
+            const SDL_GPUBufferRegion gpu_transfer_buffer_region_index = {
+                .buffer = sdl->device.buffer_index,
+                .offset = 0,
+                .size   = sdl->device.buffer_index_max,
+            };
+            SDL_UploadToGPUBuffer(copy_pass, &gpu_transfer_buffer_location_index, &gpu_transfer_buffer_region_index, false);
         }
-        SDL_SubmitGPUCommandBuffer(command_buffer);
+        SDL_EndGPUCopyPass(copy_pass);
 
-        nk_buffer_clear(&sdl->device.cmds);
-        nk_clear(&sdl->ctx);
+        // submit command buffer
+        const bool success = SDL_SubmitGPUCommandBuffer(command_buffer);
+        NK_ASSERT(success);
     }
+
+    float window_width = 0.0f;
+    float window_height = 0.0f;
+    {
+        int w;
+        int h;
+        const bool success = SDL_GetWindowSize(sdl->window, &w, &h);
+        NK_ASSERT(success);
+        window_width = (float)w;
+        window_height = (float)h;
+    }
+
+    float projection_orthographic[4][4] = {
+        {  2.0f,  0.0f,  0.0f,  0.0f },
+        {  0.0f, -2.0f,  0.0f,  0.0f },
+        {  0.0f,  0.0f, -1.0f,  0.0f },
+        { -1.0f,  1.0f,  0.0f,  1.0f },
+    };
+    projection_orthographic[0][0] = projection_orthographic[0][0] / window_width;
+    projection_orthographic[1][1] = projection_orthographic[1][1] / window_height;
+
+    /* convert from command queue into draw list and draw to screen */
+
+    /* convert shapes into vertices */
+
+    /* iterate over and execute each draw command */
+
+    SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(sdl->device.gpu);
+    NK_ASSERT(command_buffer);
+
+    SDL_GPUTexture* swapchain_texture = NULL;
+    NK_ASSERT(SDL_WaitAndAcquireGPUSwapchainTexture(command_buffer, sdl->window, &swapchain_texture, NULL, NULL));
+
+    if (NULL != swapchain_texture)
+    {
+        const SDL_GPUColorTargetInfo color_target_info = {
+            .texture = swapchain_texture,
+            .mip_level = 0,
+            .layer_or_depth_plane = 0,
+            .clear_color = { .r = color.r, .g = color.g, .b = color.b, .a = color.a },
+            .load_op = SDL_GPU_LOADOP_CLEAR,
+            .store_op = SDL_GPU_STOREOP_STORE,
+            .resolve_texture = NULL,
+            .resolve_mip_level = 0,
+            .resolve_layer = 0,
+            .cycle = false,
+            .cycle_resolve_texture = false,
+        };
+
+        SDL_GPURenderPass* render_pass = SDL_BeginGPURenderPass(command_buffer, &color_target_info, 1, NULL);
+        {
+            // bind vertex buffer
+            const SDL_GPUBufferBinding buffer_vertex_binding = { .buffer = sdl->device.buffer_vertex, .offset = 0, };
+            SDL_BindGPUVertexBuffers(render_pass, 0, &buffer_vertex_binding, 1);
+
+            // bind index buffer
+            const SDL_GPUBufferBinding buffer_index_binding = { .buffer = sdl->device.buffer_index, .offset = 0, };
+            SDL_BindGPUIndexBuffer(render_pass, &buffer_index_binding, SDL_GPU_INDEXELEMENTSIZE_16BIT);
+
+            // bind graphics pipeline
+            SDL_BindGPUGraphicsPipeline(render_pass, sdl->device.pipeline);
+
+            // push vertex uniform
+            SDL_PushGPUVertexUniformData(command_buffer, 0, projection_orthographic, sizeof(projection_orthographic));
+
+            // bind gpu fragment texture
+            SDL_BindGPUFragmentStorageTextures(render_pass, 0, &sdl->device.font_texture, 1);
+
+            // push fragment texture sampler
+            const SDL_GPUTextureSamplerBinding texture_sampler_binding = {
+                .texture = sdl->device.font_texture,
+                .sampler = sdl->device.font_sampler,
+            };
+            SDL_BindGPUFragmentSamplers(render_pass, 0, &texture_sampler_binding, 1);
+
+            Uint32 offset = 0;
+            const struct nk_draw_command* cmd = { 0 };
+
+            nk_draw_foreach(cmd, &sdl->ctx, &sdl->device.cmds)
+            {
+                if (0 == cmd->elem_count)
+                {
+                    continue;
+                }
+
+                // scissor
+                {
+                    const SDL_Rect r = {
+                        .x = (int)cmd->clip_rect.x,
+                        .y = (int)cmd->clip_rect.y,
+                        .w = (int)cmd->clip_rect.w,
+                        .h = (int)cmd->clip_rect.h,
+                    };
+                    SDL_SetGPUScissor(render_pass, &r);
+                }
+
+                // draw
+                SDL_DrawGPUIndexedPrimitives(render_pass, cmd->elem_count, 1, offset, 0, 0);
+                offset += (Uint32)cmd->elem_count;
+            }
+        }
+        SDL_EndGPURenderPass(render_pass);
+    }
+    sdl->device.fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer);
+
+    nk_buffer_clear(&sdl->device.cmds);
+    nk_clear(&sdl->ctx);
 }
 
 NK_INTERN void nk_sdl_clipboard_paste(const nk_handle usr, struct nk_text_edit* edit)
