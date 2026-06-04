@@ -18,6 +18,52 @@
 
 #include "nuklear_sdl_renderer.h"
 
+#define NK_COLOR_MAP(NK_COLOR)\
+    NK_COLOR(NK_COLOR_TEXT,                     175,175,175,255) \
+    NK_COLOR(NK_COLOR_WINDOW,                   45, 45, 45, 255) \
+    NK_COLOR(NK_COLOR_HEADER,                   40, 40, 40, 255) \
+    NK_COLOR(NK_COLOR_BORDER,                   65, 65, 65, 255) \
+    NK_COLOR(NK_COLOR_BUTTON,                   50, 50, 50, 255) \
+    NK_COLOR(NK_COLOR_BUTTON_HOVER,             40, 40, 40, 255) \
+    NK_COLOR(NK_COLOR_BUTTON_ACTIVE,            35, 35, 35, 255) \
+    NK_COLOR(NK_COLOR_TOGGLE,                   100,100,100,255) \
+    NK_COLOR(NK_COLOR_TOGGLE_HOVER,             120,120,120,255) \
+    NK_COLOR(NK_COLOR_TOGGLE_CURSOR,            45, 45, 45, 255) \
+    NK_COLOR(NK_COLOR_SELECT,                   45, 45, 45, 255) \
+    NK_COLOR(NK_COLOR_SELECT_ACTIVE,            35, 35, 35,255)  \
+    NK_COLOR(NK_COLOR_SLIDER,                   38, 38, 38, 255) \
+    NK_COLOR(NK_COLOR_SLIDER_CURSOR,            100,100,100,255) \
+    NK_COLOR(NK_COLOR_SLIDER_CURSOR_HOVER,      120,120,120,255) \
+    NK_COLOR(NK_COLOR_SLIDER_CURSOR_ACTIVE,     150,150,150,255) \
+    NK_COLOR(NK_COLOR_PROPERTY,                 38, 38, 38, 255) \
+    NK_COLOR(NK_COLOR_EDIT,                     38, 38, 38, 255) \
+    NK_COLOR(NK_COLOR_EDIT_CURSOR,              175,175,175,255) \
+    NK_COLOR(NK_COLOR_COMBO,                    45, 45, 45, 255) \
+    NK_COLOR(NK_COLOR_CHART,                    120,120,120,255) \
+    NK_COLOR(NK_COLOR_CHART_COLOR,              45, 45, 45, 255) \
+    NK_COLOR(NK_COLOR_CHART_COLOR_HIGHLIGHT,    255, 0,  0, 255) \
+    NK_COLOR(NK_COLOR_SCROLLBAR,                40, 40, 40, 255) \
+    NK_COLOR(NK_COLOR_SCROLLBAR_CURSOR,         100,100,100,255) \
+    NK_COLOR(NK_COLOR_SCROLLBAR_CURSOR_HOVER,   120,120,120,255) \
+    NK_COLOR(NK_COLOR_SCROLLBAR_CURSOR_ACTIVE,  150,150,150,255) \
+    NK_COLOR(NK_COLOR_TAB_HEADER,               40, 40, 40,255)  \
+    NK_COLOR(NK_COLOR_KNOB,                     38, 38, 38, 255) \
+    NK_COLOR(NK_COLOR_KNOB_CURSOR,              100,100,100,255) \
+    NK_COLOR(NK_COLOR_KNOB_CURSOR_HOVER,        120,120,120,255) \
+    NK_COLOR(NK_COLOR_KNOB_CURSOR_ACTIVE,       150,150,150,255)
+
+NK_GLOBAL const struct nk_color
+nk_default_color_style[NK_COLOR_COUNT] = {
+#define NK_COLOR(a,b,c,d,e) {b,c,d,e},
+    NK_COLOR_MAP(NK_COLOR)
+#undef NK_COLOR
+};
+NK_GLOBAL const char *nk_color_names[NK_COLOR_COUNT] = {
+#define NK_COLOR(a,b,c,d,e) #a,
+    NK_COLOR_MAP(NK_COLOR)
+#undef NK_COLOR
+};
+
 NK_GLOBAL const struct nk_color nk_red    = { .r = 255, .g =   0, .b =   0, .a = 255 };
 NK_GLOBAL const struct nk_color nk_green  = { .r =   0, .g = 255, .b =   0, .a = 255 };
 NK_GLOBAL const struct nk_color nk_blue   = { .r =   0, .g =   0, .b = 255, .a = 255 };
@@ -38,11 +84,11 @@ NK_GLOBAL const struct nk_color nk_yellow = { .r = 255, .g = 255, .b =   0, .a =
  * ===============================================================*/
 /* These are some code examples to provide a small overview of what can be
  * done with this library. To try out an example uncomment the defines */
-/*#define INCLUDE_ALL */
+#define INCLUDE_ALL
 /*#define INCLUDE_STYLE */
 /*#define INCLUDE_CALCULATOR */
 /*#define INCLUDE_CANVAS */
-#define INCLUDE_OVERVIEW
+/*#define INCLUDE_OVERVIEW */
 /*#define INCLUDE_CONFIGURATOR */
 /*#define INCLUDE_NODE_EDITOR */
 
