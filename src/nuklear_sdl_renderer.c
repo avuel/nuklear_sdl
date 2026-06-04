@@ -688,15 +688,6 @@ NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA
         sdl->last_render = ticks;
     }
 
-    if (NULL != sdl->device.fence)
-    {
-        // wait for last frame to submit
-        const bool success = SDL_WaitForGPUFences(sdl->device.gpu, true, &sdl->device.fence, 1);
-        NK_ASSERT(success);
-        SDL_ReleaseGPUFence(sdl->device.gpu, sdl->device.fence);
-        sdl->device.fence = NULL;
-    }
-
     /* load draw vertices & elements directly into vertex + element buffer */
     {
         /* Wait until GPU is done with buffer */
@@ -875,9 +866,16 @@ NK_API void nk_sdl_render(struct nk_context* ctx, const enum nk_anti_aliasing AA
         SDL_EndGPURenderPass(render_pass);
     }
     sdl->device.fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer);
+    NK_ASSERT(sdl->device.fence);
 
     nk_buffer_clear(&sdl->device.cmds);
     nk_clear(&sdl->ctx);
+
+    // wait for last frame to submit
+    const bool success = SDL_WaitForGPUFences(sdl->device.gpu, true, &sdl->device.fence, 1);
+    NK_ASSERT(success);
+    SDL_ReleaseGPUFence(sdl->device.gpu, sdl->device.fence);
+    sdl->device.fence = NULL;
 }
 
 NK_INTERN void nk_sdl_clipboard_paste(const nk_handle usr, struct nk_text_edit* edit)
