@@ -37,6 +37,7 @@ extern "C" {
 NK_API struct nk_context*    nk_sdl_init(SDL_Window* window, SDL_GPUDevice* gpu, struct nk_allocator allocator, int max_vertex_buffer, int max_index_buffer);
 NK_API void                  nk_sdl_shutdown(struct nk_context* ctx);
 NK_API struct nk_allocator   nk_sdl_allocator(void);
+NK_API SDL_GPUShaderFormat   nk_sdl_get_shader_formats(void);
 NK_API int                   nk_sdl_handle_event(struct nk_context* ctx, SDL_Event* evt);
 NK_API nk_bool               nk_sdl_render_needed(struct nk_context* ctx);
 NK_API void                  nk_sdl_render(struct nk_context* ctx, enum nk_anti_aliasing AA, struct nk_colorf color);

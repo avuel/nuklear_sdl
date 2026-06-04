@@ -158,14 +158,18 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         return nk_sdl_fail();
     }
 
+#if 0
 #ifdef _WIN32
     const SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_DXIL;
     const char* const gpu_driver = "direct3d12";
 #else
     const SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_SPIRV;
-    const char* const driver = "vulkan";
+    const char* const gpu_driver = "vulkan";
 #endif
     app->gpu = SDL_CreateGPUDevice(gpu_format, true, gpu_driver);
+#endif
+    const SDL_GPUShaderFormat gpu_formats = nk_sdl_get_shader_formats();
+    app->gpu = SDL_CreateGPUDevice(gpu_formats, true, NULL);
     if (NULL == app->gpu)
     {
         return nk_sdl_fail();
