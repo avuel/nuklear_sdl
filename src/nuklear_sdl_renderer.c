@@ -50,8 +50,14 @@
 #include "../vendor/nuklear/src/nuklear_window.c"
 
 // embedded shader includes
+#if 0
 #include "shaders/embed/vertex.c"
 #include "shaders/embed/pixel.c"
+#else
+/* WARN: this file doesn't have include guards and
+ * doesn't use 'static' for global variables so be careful... */
+#include "shaders/nuklear_sdl3_gpu_data.c"
+#endif
 
 // third party includes
 #include <SDL3/SDL_gpu.h>
@@ -142,6 +148,75 @@ NK_API struct nk_context* nk_sdl_init(SDL_Window* window, SDL_GPUDevice* gpu, co
     return &sdl->ctx;
 }
 
+/*
+ * Helper for retrieving the entries from nuklear_sdl3_gpu_data.c
+ * Returns 'true' and populates 'out' upon success, otherwise returns 'false'
+ * Failure means that the 'stage' and/or 'format' is either unsupported or invalid
+ * 'out==NULL' is allowed, and can be useful for checking the support of specific format
+ */
+NK_INTERN bool nk_sdl_get_shader_info(
+        SDL_GPUShaderCreateInfo  *out,
+        SDL_GPUShaderStage       stage,
+        SDL_GPUShaderFormat      format)
+{
+    SDL_assert(SDL_HasExactlyOneBitSet32(format));
+
+#define _NK_SDL_GET_SHADER_INFO_BRANCH(STAGE, FORMAT)                       \
+    if (__nuklear_sdl3_gpu_##STAGE##_##FORMAT##_len &&                      \
+        stage  == SDL_GPU_SHADERSTAGE_##STAGE &&                            \
+        format == SDL_GPU_SHADERFORMAT_##FORMAT)                            \
+    {                                                                       \
+        if (out) {                                                          \
+            out->code_size   = __nuklear_sdl3_gpu_##STAGE##_##FORMAT##_len; \
+            out->code        = __nuklear_sdl3_gpu_##STAGE##_##FORMAT;       \
+            out->entrypoint  = #STAGE;                                      \
+            out->format      = SDL_GPU_SHADERFORMAT_##FORMAT;               \
+            out->stage       = SDL_GPU_SHADERSTAGE_##STAGE;                 \
+        }                                                                   \
+        return true;                                                        \
+    }                                                                       \
+
+    /* everything that is currently recongized by SDL3
+     * https://wiki.libsdl.org/SDL3/SDL_GPUShaderFormat */
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  VERTEX,    PRIVATE   )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  FRAGMENT,  PRIVATE   )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  VERTEX,    SPIRV     )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  FRAGMENT,  SPIRV     )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  VERTEX,    DXBC      )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  FRAGMENT,  DXBC      )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  VERTEX,    DXIL      )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  FRAGMENT,  DXIL      )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  VERTEX,    MSL       )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  FRAGMENT,  MSL       )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  VERTEX,    METALLIB  )
+    _NK_SDL_GET_SHADER_INFO_BRANCH(  FRAGMENT,  METALLIB  )
+
+#undef _NK_SDL_GET_SHADER_INFO_BRANCH
+
+    /* FIXME: add SDL error here (?) */
+    return false;
+}
+
+NK_API SDL_GPUShaderFormat nk_sdl_get_shader_formats(void)
+{
+    SDL_GPUShaderFormat all[] = {
+        SDL_GPU_SHADERFORMAT_PRIVATE,
+        SDL_GPU_SHADERFORMAT_SPIRV,
+        SDL_GPU_SHADERFORMAT_DXBC,
+        SDL_GPU_SHADERFORMAT_DXIL,
+        SDL_GPU_SHADERFORMAT_MSL,
+        SDL_GPU_SHADERFORMAT_METALLIB,
+    };
+    SDL_GPUShaderFormat ret = 0;
+    for (int i = 0; i < SDL_arraysize(all); i++) {
+        if (nk_sdl_get_shader_info(NULL, SDL_GPU_SHADERSTAGE_VERTEX, all[i])) {
+            ret |= all[i];
+        }
+    }
+    return ret;
+}
+
+
 NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
 {
     NK_ASSERT(sdl);
@@ -163,6 +238,7 @@ NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
     NK_ASSERT(SDL_GPU_SHADERFORMAT_INVALID != gpu_format);
 
     // upload vertex shader program
+#if 0
     const SDL_GPUShaderCreateInfo shader_vertex_create_info = {
         .code_size = sizeof(embed_vertex),
         .code = embed_vertex,
@@ -175,11 +251,23 @@ NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
         .num_uniform_buffers = 1,
         .props = 0,
     };
+#else
+    SDL_GPUShaderCreateInfo shader_vertex_create_info;
+    if (!nk_sdl_get_shader_info(&shader_vertex_create_info, SDL_GPU_SHADERSTAGE_VERTEX, gpu_format)) {
+        NK_ASSERT(!"yeiks");
+    }
+    shader_vertex_create_info.num_samplers          = 0;
+    shader_vertex_create_info.num_storage_textures  = 0;
+    shader_vertex_create_info.num_storage_buffers   = 0;
+    shader_vertex_create_info.num_uniform_buffers   = 1;
+    shader_vertex_create_info.props = 0;
+#endif
 
     SDL_GPUShader* gpu_shader_vertex = SDL_CreateGPUShader(sdl->device.gpu, &shader_vertex_create_info);
     NK_ASSERT(gpu_shader_vertex);
 
     // upload pixel shader program
+#if 0
     const SDL_GPUShaderCreateInfo shader_pixel_create_info = {
         .code_size = sizeof(embed_pixel),
         .code = embed_pixel,
@@ -192,6 +280,17 @@ NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
         .num_uniform_buffers = 0,
         .props = 0,
     };
+#else
+    SDL_GPUShaderCreateInfo shader_pixel_create_info;
+    if (!nk_sdl_get_shader_info(&shader_pixel_create_info, SDL_GPU_SHADERSTAGE_FRAGMENT, gpu_format)) {
+        NK_ASSERT(!"yeiks");
+    }
+    shader_pixel_create_info.num_samplers          = 1;
+    shader_pixel_create_info.num_storage_textures  = 1;
+    shader_pixel_create_info.num_storage_buffers   = 0;
+    shader_pixel_create_info.num_uniform_buffers   = 0;
+    shader_pixel_create_info.props = 0;
+#endif
 
     SDL_GPUShader* gpu_shader_pixel = SDL_CreateGPUShader(sdl->device.gpu, &shader_pixel_create_info);
     NK_ASSERT(gpu_shader_pixel);
@@ -238,7 +337,10 @@ NK_INTERN void nk_sdl_device_create(struct nk_sdl* sdl)
             .sample_count = 0,
             .sample_mask  = 0,
             .enable_mask  = false,
-            .enable_alpha_to_coverage = false,
+            // FIXME: this line fails on my macOS VM due to...
+            // "error: field designator 'enable_alpha_to_coverage' does not refer to any field in type 'SDL_GPUMultisampleState' (aka 'struct SDL_GPUMultisampleState')"
+            // ...but memory should still be zero'ed, so it's not a big deal (I hope)
+            //.enable_alpha_to_coverage = false,
         },
         .depth_stencil_state = {
             .compare_op = SDL_GPU_COMPAREOP_INVALID,
