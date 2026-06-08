@@ -16,7 +16,7 @@
 #define SDL_MAIN_USE_CALLBACKS
 #include <SDL3/SDL_main.h>
 
-#include "nuklear_sdl_renderer.h"
+#include "nuklear_sdl_gpu.h"
 
 #define NK_COLOR_MAP(NK_COLOR)\
     NK_COLOR(NK_COLOR_TEXT,                     175,175,175,255) \
@@ -85,12 +85,12 @@ NK_GLOBAL const struct nk_color nk_yellow = { .r = 255, .g = 255, .b =   0, .a =
 /* These are some code examples to provide a small overview of what can be
  * done with this library. To try out an example uncomment the defines */
 #define INCLUDE_ALL
-/*#define INCLUDE_STYLE */
-/*#define INCLUDE_CALCULATOR */
-/*#define INCLUDE_CANVAS */
-/*#define INCLUDE_OVERVIEW */
-/*#define INCLUDE_CONFIGURATOR */
-/*#define INCLUDE_NODE_EDITOR */
+/* #define INCLUDE_STYLE        */
+/* #define INCLUDE_CALCULATOR   */
+/* #define INCLUDE_CANVAS       */
+/* #define INCLUDE_OVERVIEW     */
+/* #define INCLUDE_CONFIGURATOR */
+/* #define INCLUDE_NODE_EDITOR  */
 
 #ifdef INCLUDE_ALL
     #define INCLUDE_STYLE
@@ -99,26 +99,26 @@ NK_GLOBAL const struct nk_color nk_yellow = { .r = 255, .g = 255, .b =   0, .a =
     #define INCLUDE_OVERVIEW
     #define INCLUDE_CONFIGURATOR
     #define INCLUDE_NODE_EDITOR
-#endif
+#endif /* INCLUDE_ALL */
 
 #ifdef INCLUDE_STYLE
     #include "../vendor/nuklear/demo/common/style.c"
-#endif
+#endif /* INCLUDE_STYLE */
 #ifdef INCLUDE_CALCULATOR
     #include "../vendor/nuklear/demo/common/calculator.c"
-#endif
+#endif /* INCLUDE_CALCULATOR */
 #ifdef INCLUDE_CANVAS
     #include "../vendor/nuklear/demo/common/canvas.c"
-#endif
+#endif /* INCLUDE_CANVAS */
 #ifdef INCLUDE_OVERVIEW
     #include "../vendor/nuklear/demo/common/overview.c"
-#endif
+#endif /* INCLUDE_OVERVIEW */
 #ifdef INCLUDE_CONFIGURATOR
     #include "../vendor/nuklear/demo/common/style_configurator.c"
-#endif
+#endif /* INCLUDE_CONFIGURATOR */
 #ifdef INCLUDE_NODE_EDITOR
     #include "../vendor/nuklear/demo/common/node_editor.c"
-#endif
+#endif /* INCLUDE_NODE_EDITOR */
 
 /* ===============================================================
  *
@@ -148,7 +148,13 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     NK_UNUSED(argc);
     NK_UNUSED(argv);
 
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS))
+    {
+        return nk_sdl_fail();
+    }
+
+    if (!SDL_ShaderCross_Init())
+    {
         return nk_sdl_fail();
     }
 
@@ -158,20 +164,30 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         return nk_sdl_fail();
     }
 
-#ifdef _WIN32
-    const SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_DXIL;
+    /* TODO: should we pass NULL and let sdl pick driver... */
+#if defined(_WIN32)
+    /* TODO: vulkan performance seems a lot faster directx... */
+#if 1
     const char* const gpu_driver = "direct3d12";
 #else
-    const SDL_GPUShaderFormat gpu_format = SDL_GPU_SHADERFORMAT_SPIRV;
-    const char* const driver = "vulkan";
+    const char* const gpu_driver = "vulkan";
 #endif
-    app->gpu = SDL_CreateGPUDevice(gpu_format, true, gpu_driver);
+#elif defined(__linux__)
+    const char* const gpu_driver = "vulkan";
+#elif defined(__APPLE__) && defined(__MACH__)
+    const char* const gpu_driver = "metal";
+#else
+#error "unknown platform"
+#endif
+
+    const SDL_GPUShaderFormat gpu_formats = nk_sdl_get_shader_formats();
+    app->gpu = SDL_CreateGPUDevice(gpu_formats, true, gpu_driver);
     if (NULL == app->gpu)
     {
         return nk_sdl_fail();
     }
 
-    app->window = SDL_CreateWindow("cui", WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_HIDDEN);
+    app->window = SDL_CreateWindow("Nuklear Demo: SDL GPU", WINDOW_WIDTH, WINDOW_HEIGHT, SDL_WINDOW_HIDDEN);
     if (NULL == app->window)
     {
         return nk_sdl_fail();
@@ -184,6 +200,9 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         return nk_sdl_fail();
     }
 
+    /* set sdr composition and immediate present mode (no vsync) */
+    SDL_SetGPUSwapchainParameters(app->gpu, app->window, SDL_GPU_SWAPCHAINCOMPOSITION_SDR, SDL_GPU_PRESENTMODE_IMMEDIATE);
+
     app->bg.r = 0.10f;
     app->bg.g = 0.18f;
     app->bg.b = 0.24f;
@@ -191,15 +210,17 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
 
 
     font_scale = 1;
-    // {
-    //     /* This scaling logic was kept simple for the demo purpose.
-    //      * On some platforms, this might not be the exact scale
-    //      * that you want to use. For more information, see:
-    //      * https://wiki.libsdl.org/SDL3/README-highdpi */
-    //     const float scale = SDL_GetWindowDisplayScale(app->window);
-    //     SDL_SetRenderScale(app->renderer, scale, scale);
-    //     font_scale = scale;
-    // }
+#if 0
+    {
+        /* This scaling logic was kept simple for the demo purpose.
+         * On some platforms, this might not be the exact scale
+         * that you want to use. For more information, see:
+         * https://wiki.libsdl.org/SDL3/README-highdpi */
+        const float scale = SDL_GetWindowDisplayScale(app->window);
+        SDL_SetRenderScale(app->renderer, scale, scale);
+        font_scale = scale;
+    }
+#endif
 
     ctx = nk_sdl_init(app->window, app->gpu, nk_sdl_allocator(), MAX_VERTEX_BUFFER, MAX_INDEX_BUFFER);
     app->ctx = ctx;
@@ -276,25 +297,24 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event* event)
     struct nk_sdl_app* app = (struct nk_sdl_app*)appstate;
 
     switch (event->type) {
-        case SDL_EVENT_QUIT:
-            return SDL_APP_SUCCESS;
+        case SDL_EVENT_QUIT: { return SDL_APP_SUCCESS; }
         case SDL_EVENT_KEY_DOWN:
-            if (event->key.key == SDLK_Q && event->key.mod & SDL_KMOD_CTRL) {
-                return SDL_APP_SUCCESS;
-            }
+        {
+            if (SDLK_Q == event->key.key && (SDL_KMOD_CTRL & event->key.mod)) { return SDL_APP_SUCCESS; }
             break;
+        }
         case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+        {
             /* You may wish to rescale the renderer and Nuklear during this event.
              * Without this the UI and Font could appear too small or too big.
              * This is not handled by the demo in order to keep it simple,
              * but you may wish to re-bake the Font whenever this happens. */
             SDL_Log("Unhandled scale event! Nuklear may appear blurry");
             return SDL_APP_CONTINUE;
+        }
     }
 
-    /* Remember to always rescale the event coordinates,
-     * if your renderer uses custom scale. */
-    // SDL_ConvertEventToRenderCoordinates(app->renderer, event);
+    /* TODO: rescale to render coordinates */
 
     nk_sdl_handle_event(app->ctx, event);
 
@@ -309,7 +329,7 @@ SDL_AppResult SDL_AppIterate(void *appstate)
 #ifdef INCLUDE_CONFIGURATOR
     static struct nk_color color_table[NK_COLOR_COUNT];
     NK_MEMCPY(color_table, nk_default_color_style, sizeof(color_table));
-#endif
+#endif /* INCLUDE_CONFIGURATOR */
 
     nk_input_end(ctx);
 
@@ -351,28 +371,36 @@ SDL_AppResult SDL_AppIterate(void *appstate)
     /* -------------- EXAMPLES ---------------- */
     #ifdef INCLUDE_CALCULATOR
         calculator(ctx);
-    #endif
+    #endif /* INCLUDE_CALCULATOR */
     #ifdef INCLUDE_CANVAS
         canvas(ctx);
-    #endif
+    #endif /* INCLUDE_CANVAS */
     #ifdef INCLUDE_OVERVIEW
         overview(ctx);
-    #endif
+    #endif /* INCLUDE_OVERVIEW */
     #ifdef INCLUDE_CONFIGURATOR
         style_configurator(ctx, color_table);
-    #endif
+    #endif /* INCLUDE_CONFIGURATOR */
     #ifdef INCLUDE_NODE_EDITOR
         node_editor(ctx);
-    #endif
+    #endif /* INCLUDE_NODE_EDITOR */
     /* ----------------------------------------- */
 
     if (nk_sdl_render_needed(app->ctx))
     {
+#if 0
         static size_t count = 0;
         ++count;
-        fprintf(stderr, "redraw count: %zu\n", count);
+        SDL_Log("redraw count: %zu\n", count);
+#endif
 
+        const Uint64 beg  = SDL_GetTicksNS();
         nk_sdl_render(ctx, app->AA, app->bg);
+        const Uint64 end  = SDL_GetTicksNS();
+        const double diff = (double)(end - beg);
+        const double dt   = diff / 1e6;
+        const double fps  = 1e9  / diff;
+        SDL_Log("(frame time, fps) = (%.3f, %.3f)", dt, fps);
         nk_sdl_update_text_input(ctx);
     }
 
@@ -393,4 +421,7 @@ void SDL_AppQuit(void* appstate, const SDL_AppResult result)
         SDL_DestroyWindow(app->window);
         SDL_free(app);
     }
+
+    SDL_ShaderCross_Quit();
+    SDL_Quit();
 }

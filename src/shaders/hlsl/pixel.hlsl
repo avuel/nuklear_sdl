@@ -6,7 +6,7 @@ struct output_ps
     float4 color : SV_Target;
 };
 
-output_ps ps_main(float2 uv : TEXCOORD0, float4 color : TEXCOORD1)
+output_ps main_ps(float2 uv : TEXCOORD0, float4 color : TEXCOORD1)
 {
     output_ps result;
 

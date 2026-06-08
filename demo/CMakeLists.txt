@@ -13,5 +13,5 @@ set_target_properties(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME}
         PRIVATE
-            nuklear_sdl::nuklear_sdl
+            nuklear_sdl_gpu::nuklear_sdl_gpu
 )
